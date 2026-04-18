@@ -4624,6 +4624,18 @@ async fn gql_query(
         }
     };
 
+    // Helper: emit query.complete and update metrics for early-return paths.
+    // Called by all the match arms that don't go through execute_gql_on_store.
+    let emit_quick = |stmt_type: &'static str, dur: u64, is_err: bool| {
+        let slow = dur >= state.logger.slow_threshold_us();
+        let ev = state.logger.query_complete(
+            &req_id, "gql", stmt_type, query, dur, 0, dur,
+            &[], 0, 0, 0, 0, false, None, None,
+        );
+        state.logger.emit(ev);
+        state.metrics.record_query(dur, stmt_type, slow, is_err);
+    };
+
     // Handle statements that don't need an existing bundle
     match &stmt {
         gigi::parser::Statement::CreateBundle {
@@ -4654,6 +4666,7 @@ async fn gql_query(
             }
             let mut engine = state.engine.write().unwrap();
             engine.create_bundle(schema).unwrap();
+            emit_quick("CREATE_BUNDLE", t0.elapsed().as_micros() as u64, false);
             return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
         }
         gigi::parser::Statement::ShowBundles => {
@@ -4670,13 +4683,16 @@ async fn gql_query(
                     })
                 })
                 .collect();
+            emit_quick("SHOW_BUNDLES", t0.elapsed().as_micros() as u64, false);
             return (StatusCode::OK, Json(serde_json::json!({"bundles": list})));
         }
         gigi::parser::Statement::Collapse { bundle } => {
             let mut engine = state.engine.write().unwrap();
             if engine.drop_bundle(bundle).unwrap_or(false) {
+                emit_quick("DROP_BUNDLE", t0.elapsed().as_micros() as u64, false);
                 return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
             } else {
+                emit_quick("DROP_BUNDLE", t0.elapsed().as_micros() as u64, true);
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": format!("No bundle: {bundle}")})),
@@ -4686,6 +4702,7 @@ async fn gql_query(
         gigi::parser::Statement::AtlasBegin
         | gigi::parser::Statement::AtlasCommit
         | gigi::parser::Statement::AtlasRollback => {
+            emit_quick("OTHER", t0.elapsed().as_micros() as u64, false);
             return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
         }
         // v2.1: statements parsed but not yet implemented — return 501
@@ -4709,6 +4726,7 @@ async fn gql_query(
         | gigi::parser::Statement::Restore { .. }
         | gigi::parser::Statement::VerifyBackup { .. }
         | gigi::parser::Statement::CommentOn { .. } => {
+            emit_quick("OTHER", t0.elapsed().as_micros() as u64, false);
             return (
                 StatusCode::NOT_IMPLEMENTED,
                 Json(serde_json::json!({"error": "This GQL v2.1 command is not yet implemented"})),
@@ -4719,19 +4737,45 @@ async fn gql_query(
             let engine = state.engine.read().unwrap();
             let store_a = match engine.bundle(bundle_a) {
                 Some(s) => s,
-                None => return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Bundle '{}' not found", bundle_a)})),
-                ),
+                None => {
+                    emit_quick("DIVERGENCE", t0.elapsed().as_micros() as u64, true);
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": format!("Bundle '{}' not found", bundle_a)})),
+                    );
+                }
             };
             let store_b = match engine.bundle(bundle_b) {
                 Some(s) => s,
-                None => return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Bundle '{}' not found", bundle_b)})),
-                ),
+                None => {
+                    emit_quick("DIVERGENCE", t0.elapsed().as_micros() as u64, true);
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": format!("Bundle '{}' not found", bundle_b)})),
+                    );
+                }
             };
             let rep = gigi::metric::kl_divergence_ref(&store_a, &store_b);
+            let dur = t0.elapsed().as_micros() as u64;
+            let slow = dur >= state.logger.slow_threshold_us();
+            // Emit query.complete with actual geometric values for DIVERGENCE
+            let geo = gigi::observability::GeometricFields {
+                kl_forward:      Some(rep.kl_forward),
+                kl_reverse:      Some(rep.kl_reverse),
+                jensen_shannon:  Some(rep.jensen_shannon),
+                fields_compared: Some(rep.fields_compared as u32),
+                ..Default::default()
+            };
+            let ev = state.logger.query_complete(
+                &req_id, "gql", "DIVERGENCE", query, dur, 0, dur,
+                &[bundle_a.clone(), bundle_b.clone()], 0, 1, 0, 0, false, Some(geo), None,
+            );
+            state.logger.emit(ev);
+            if slow {
+                let ev2 = state.logger.query_slow(&req_id, "DIVERGENCE", query, dur, false, false, "divergence computation");
+                state.logger.emit(ev2);
+            }
+            state.metrics.record_query(dur, "DIVERGENCE", slow, false);
             let per_field: String = rep
                 .per_field
                 .iter()
@@ -4756,7 +4800,10 @@ async fn gql_query(
 
     let bundle_name = match get_bundle_name(&stmt) {
         Some(name) => name,
-        None => return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        None => {
+            emit_quick("OTHER", t0.elapsed().as_micros() as u64, false);
+            return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        }
     };
 
     // Derive a short statement type string for metrics/logging
