@@ -18,6 +18,7 @@ pub mod hash;
 pub mod join;
 pub mod metric;
 pub mod mmap_bundle;
+pub mod observability;
 pub mod parser;
 pub mod query;
 pub mod sheaf;

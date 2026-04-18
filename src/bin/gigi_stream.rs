@@ -40,6 +40,7 @@ use gigi::curvature;
 use gigi::dhoom;
 use gigi::engine::Engine;
 use gigi::join;
+use gigi::observability::{GeometricFields, LogConfig, Logger, Metrics, new_request_id};
 use gigi::spectral;
 use gigi::types::{BundleSchema, FieldDef, FieldType, Value};
 
@@ -65,6 +66,10 @@ struct StreamState {
     rate_tracker: RwLock<HashMap<String, Vec<Instant>>>,
     /// Server start time for uptime tracking
     start_time: Instant,
+    /// Structured logger — fire-and-forget, non-blocking.
+    logger: Logger,
+    /// Live metrics counters for GET /v1/metrics.
+    metrics: Arc<Metrics>,
 }
 
 /// A mutation event broadcast to all subscribers of a bundle.
@@ -113,7 +118,7 @@ struct DashboardEvent {
 }
 
 impl StreamState {
-    fn new() -> Self {
+    fn new(logger: Logger, metrics: Arc<Metrics>) -> Self {
         let api_key = std::env::var("GIGI_API_KEY").ok();
         let rate_limit = std::env::var("GIGI_RATE_LIMIT")
             .ok()
@@ -150,6 +155,8 @@ impl StreamState {
             rate_window_secs,
             rate_tracker: RwLock::new(HashMap::new()),
             start_time: Instant::now(),
+            logger,
+            metrics,
         }
     }
 
@@ -1002,6 +1009,46 @@ async fn health(State(state): State<Arc<StreamState>>) -> (StatusCode, Json<Heal
     }
 }
 
+/// GET /v1/metrics — live telemetry for operators, dashboards, and alerting.
+async fn metrics_handler(
+    State(state): State<Arc<StreamState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let m = &state.metrics;
+    let (p50, p95, p99) = m.percentiles();
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let (bundle_count, total_records) = state.engine.try_read()
+        .map(|e| (e.bundle_names().len(), e.total_records()))
+        .unwrap_or((0, 0));
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "instance":              state.logger.instance,
+        "version":               gigi::observability::GIGI_VERSION,
+        "uptime_secs":           uptime_secs,
+        "bundles":               bundle_count,
+        "total_records":         total_records,
+        "queries": {
+            "total":             m.queries_total.load(Ordering::Relaxed),
+            "errors":            m.queries_error.load(Ordering::Relaxed),
+            "slow":              m.queries_slow.load(Ordering::Relaxed),
+            "by_type":           m.by_type_snapshot(),
+        },
+        "latency_us": {
+            "p50":  p50,
+            "p95":  p95,
+            "p99":  p99,
+        },
+        "ingest": {
+            "records_total":     m.records_ingested.load(Ordering::Relaxed),
+            "bytes_total":       m.bytes_ingested.load(Ordering::Relaxed),
+        },
+        "anomalies_total":       m.anomalies_total.load(Ordering::Relaxed),
+        "connections": {
+            "http_total":        m.http_connections_total.load(Ordering::Relaxed),
+            "ws_total":          m.ws_connections_total.load(Ordering::Relaxed),
+        }
+    })))
+}
+
 async fn list_bundles(State(state): State<Arc<StreamState>>) -> Json<Vec<BundleInfo>> {
     let engine = state.engine.read().unwrap();
     let infos: Vec<BundleInfo> = engine
@@ -1278,6 +1325,13 @@ async fn insert_records(
 
     // Emit anomaly event when pre-insert detection flagged this record
     if let Some((k_rec, z, contributing)) = pre_anomaly {
+        state.metrics.record_anomaly();
+        let ev = state.logger.anomaly_detected(
+            &name, "stream-insert",
+            k_rec, store.curvature_stats().mean(), store.curvature_stats().std_dev(),
+            z, 2.0, 3.0, &contributing, "insert", 0,
+        );
+        state.logger.emit(ev);
         let _ = state.dashboard_tx.send(build_dashboard_event(
             "anomaly",
             &name,
@@ -1289,6 +1343,16 @@ async fn insert_records(
         ));
     }
 
+    // Observability: ingest.complete
+    {
+        let bytes_est = estimate_bytes(&records);
+        let ev = state.logger.ingest_complete(
+            &name, inserted as u64, bytes_est, 0, true, false, &[], None, Some(k),
+        );
+        state.logger.emit(ev);
+        state.metrics.record_ingest(inserted as u64, bytes_est);
+    }
+
     Ok(Json(serde_json::json!({
         "status": "inserted",
         "count": inserted,
@@ -1296,6 +1360,11 @@ async fn insert_records(
         "curvature": k,
         "confidence": conf
     })))
+}
+
+// Helper: estimate byte size of records before insertion
+fn estimate_bytes(records: &[Record]) -> u64 {
+    records.iter().map(|r| r.len() as u64 * 64).sum()
 }
 
 /// Streaming NDJSON ingest — accepts newline-delimited JSON via chunked body.
@@ -4524,9 +4593,16 @@ async fn gql_query(
     State(state): State<Arc<StreamState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let t0 = Instant::now();
+    let req_id = new_request_id();
+
     let query = match body.get("query").and_then(|v| v.as_str()) {
         Some(q) => q,
         None => {
+            let dur = t0.elapsed().as_micros() as u64;
+            let e = state.logger.query_error(&req_id, "", dur, "BadRequest", "Missing 'query' field", 400);
+            state.logger.emit(e);
+            state.metrics.record_query(dur, "UNKNOWN", false, true);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "Missing 'query' field"})),
@@ -4537,6 +4613,10 @@ async fn gql_query(
     let stmt = match gigi::parser::parse(query) {
         Ok(s) => s,
         Err(e) => {
+            let dur = t0.elapsed().as_micros() as u64;
+            let ev = state.logger.query_error(&req_id, query, dur, "ParseError", &e.to_string(), 400);
+            state.logger.emit(ev);
+            state.metrics.record_query(dur, "UNKNOWN", false, true);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("Parse error: {e}")})),
@@ -4679,6 +4759,9 @@ async fn gql_query(
         None => return (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
     };
 
+    // Derive a short statement type string for metrics/logging
+    let stmt_type = gql_stmt_type_name(&stmt);
+
     // Check if bundle needs write access
     let needs_write = matches!(
         &stmt,
@@ -4696,6 +4779,10 @@ async fn gql_query(
         let mut store = match engine.bundle_mut(&bundle_name) {
             Some(s) => s,
             None => {
+                let dur = t0.elapsed().as_micros() as u64;
+                let ev = state.logger.query_error(&req_id, query, dur, "BundleNotFound", &format!("No bundle: {bundle_name}"), 404);
+                state.logger.emit(ev);
+                state.metrics.record_query(dur, stmt_type, false, true);
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": format!("No bundle: {bundle_name}")})),
@@ -4703,18 +4790,37 @@ async fn gql_query(
             }
         };
         let result = execute_gql_on_store(&mut store, &stmt);
-        match result {
+        let dur = t0.elapsed().as_micros() as u64;
+        let (status, resp) = match result {
             Ok(r) => exec_result_to_response(r),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            ),
+            Err(e) => {
+                let ev = state.logger.query_error(&req_id, query, dur, "ExecError", &e, 500);
+                state.logger.emit(ev);
+                state.metrics.record_query(dur, stmt_type, false, true);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})));
+            }
+        };
+        let slow = dur >= state.logger.slow_threshold_us();
+        let ev = state.logger.query_complete(
+            &req_id, "gql", stmt_type, query, dur, 0, dur,
+            &[bundle_name.clone()], 0, 0, 0, 0, false, None, None,
+        );
+        state.logger.emit(ev);
+        if slow {
+            let ev2 = state.logger.query_slow(&req_id, stmt_type, query, dur, false, false, "write path");
+            state.logger.emit(ev2);
         }
+        state.metrics.record_query(dur, stmt_type, slow, false);
+        (status, resp)
     } else {
         let engine = state.engine.read().unwrap();
         let store = match engine.bundle(&bundle_name) {
             Some(s) => s,
             None => {
+                let dur = t0.elapsed().as_micros() as u64;
+                let ev = state.logger.query_error(&req_id, query, dur, "BundleNotFound", &format!("No bundle: {bundle_name}"), 404);
+                state.logger.emit(ev);
+                state.metrics.record_query(dur, stmt_type, false, true);
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": format!("No bundle: {bundle_name}")})),
@@ -4722,13 +4828,28 @@ async fn gql_query(
             }
         };
         let result = execute_gql_on_store_read(&store, &stmt);
-        match result {
+        let dur = t0.elapsed().as_micros() as u64;
+        let (status, resp) = match result {
             Ok(r) => exec_result_to_response(r),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            ),
+            Err(e) => {
+                let ev = state.logger.query_error(&req_id, query, dur, "ExecError", &e, 500);
+                state.logger.emit(ev);
+                state.metrics.record_query(dur, stmt_type, false, true);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})));
+            }
+        };
+        let slow = dur >= state.logger.slow_threshold_us();
+        let ev = state.logger.query_complete(
+            &req_id, "gql", stmt_type, query, dur, 0, dur,
+            &[bundle_name.clone()], 0, 0, 0, 0, false, None, None,
+        );
+        state.logger.emit(ev);
+        if slow {
+            let ev2 = state.logger.query_slow(&req_id, stmt_type, query, dur, false, false, "read path");
+            state.logger.emit(ev2);
         }
+        state.metrics.record_query(dur, stmt_type, slow, false);
+        (status, resp)
     }
 }
 
@@ -5441,6 +5562,33 @@ fn get_bundle_name(stmt: &gigi::parser::Statement) -> Option<String> {
     }
 }
 
+/// Return a short uppercase name for a GQL statement (used in metrics + logs).
+fn gql_stmt_type_name(stmt: &gigi::parser::Statement) -> &'static str {
+    use gigi::parser::Statement::*;
+    match stmt {
+        Select { .. }         => "SELECT",
+        Insert { .. }         => "INSERT",
+        BatchInsert { .. }    => "BATCH_INSERT",
+        SectionUpsert { .. }  => "UPSERT",
+        Redefine { .. }       => "UPDATE",
+        BulkRedefine { .. }   => "BULK_UPDATE",
+        Retract { .. }        => "DELETE",
+        BulkRetract { .. }    => "BULK_DELETE",
+        PointQuery { .. }     => "POINT_GET",
+        Divergence { .. }     => "DIVERGENCE",
+        Ricci { .. }          => "RICCI",
+        Curvature { .. }      => "CURVATURE",
+        Spectral { .. }       => "SPECTRAL",
+        CreateBundle { .. }   => "CREATE_BUNDLE",
+        Collapse { .. }       => "DROP_BUNDLE",
+        ShowBundles           => "SHOW_BUNDLES",
+        Describe { .. }       => "DESCRIBE",
+        Explain { .. }        => "EXPLAIN",
+        Join { .. } | Pullback { .. } => "JOIN",
+        _                     => "OTHER",
+    }
+}
+
 fn exec_result_to_response(
     result: gigi::parser::ExecResult,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -5606,7 +5754,13 @@ async fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3142".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
-    let state = Arc::new(StreamState::new());
+    // ── Observability: create Logger + Metrics before anything else ──────────
+    let instance_name = std::env::var("GIGI_INSTANCE").unwrap_or_else(|_| "gigi-stream".to_string());
+    let (logger, log_ingester) = Logger::new(LogConfig::default(), instance_name.clone());
+    tokio::spawn(log_ingester.run());
+    let metrics = Arc::new(Metrics::new());
+
+    let state = Arc::new(StreamState::new(logger, metrics));
 
     let app = Router::new()
         // Health
@@ -5684,6 +5838,8 @@ async fn main() {
         .route("/v1/bundles/{name}/anomalies/field", post(field_anomalies))
         // KL Divergence — cross-bundle information geometry
         .route("/v1/divergence", post(divergence_handler))
+        // Observability
+        .route("/v1/metrics", get(metrics_handler))
         // WebSocket — per-bundle subscriptions + global dashboard
         .route("/ws", get(ws_handler))
         .route("/v1/ws/dashboard", get(ws_dashboard_handler))
@@ -5735,6 +5891,19 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("Listening on {addr} — starting WAL replay in background…");
+
+    // system.startup event — fired once the socket is bound and accepting
+    {
+        let e = state.logger.system_startup(
+            &std::env::var("GIGI_DATA_DIR").unwrap_or_else(|_| "./gigi_data".to_string()),
+            0, // bundles_loaded: will be accurate after WAL replay
+            0, // wal_replayed: will be accurate after WAL replay
+            0, // records_recovered: will be accurate after WAL replay
+            state.start_time.elapsed().as_micros() as u64,
+            &addr,
+        );
+        state.logger.emit(e);
+    }
 
     // Spawn WAL replay on a blocking thread so HTTP is reachable immediately.
     // After replay, snapshot to DHOOM and reopen in mmap mode to drop the
