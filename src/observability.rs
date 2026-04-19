@@ -459,6 +459,105 @@ impl Logger {
             .field("http_status", http_status)
     }
 
+    /// Spec §3.1: emit before parsing. Lets operators detect queries that started
+    /// but never completed (timeout / OOM / crash).
+    pub fn query_start(
+        &self,
+        request_id: &str,
+        source:     &str,
+        raw_gql:    &str,
+        client_ip:  &str,
+        user_agent: &str,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Query, "query.start", &self.instance)
+            .with_request_id(request_id)
+            .field("source",     source)
+            .field("raw_gql",    raw_gql)
+            .field("client_ip",  client_ip)
+            .field("user_agent", user_agent)
+    }
+
+    // ── Stream event builders (§3.5) ──────────────────────────────────────────
+
+    pub fn stream_subscribe(
+        &self,
+        connection_id: &str,
+        bundle:        &str,
+        client_ip:     &str,
+        mode:          &str,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.subscribe", &self.instance)
+            .field("connection_id", connection_id)
+            .field("bundle",        bundle)
+            .field("client_ip",     client_ip)
+            .field("mode",          mode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_push(
+        &self,
+        connection_id: &str,
+        bundle:        &str,
+        message_seq:   u64,
+        duration_us:   u64,
+        bytes_sent:    u64,
+        k_global:      f64,
+        is_anomaly:    bool,
+        z_score:       f64,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.push", &self.instance)
+            .with_duration_us(duration_us)
+            .field("connection_id", connection_id)
+            .field("bundle",        bundle)
+            .field("message_seq",   message_seq)
+            .field("bytes_sent",    bytes_sent)
+            .field("k_global",      k_global)
+            .field("is_anomaly",    is_anomaly)
+            .field("z_score",       z_score)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_anomaly_push(
+        &self,
+        connection_id:       &str,
+        bundle:              &str,
+        message_seq:         u64,
+        k_global:            f64,
+        k_threshold_3s:      f64,
+        z_score:             f64,
+        contributing_fields: &[String],
+        duration_us:         u64,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Warn, LogCategory::Stream, "stream.anomaly_push", &self.instance)
+            .with_duration_us(duration_us)
+            .field("connection_id",      connection_id)
+            .field("bundle",             bundle)
+            .field("message_seq",        message_seq)
+            .field("k_global",           k_global)
+            .field("k_threshold_3s",     k_threshold_3s)
+            .field("z_score",            z_score)
+            .field("is_anomaly",         true)
+            .field("contributing_fields", serde_json::json!(contributing_fields))
+    }
+
+    pub fn stream_disconnect(
+        &self,
+        connection_id:      &str,
+        bundle:             &str,
+        session_duration_us: u64,
+        messages_sent:      u64,
+        anomalies_sent:     u64,
+        reason:             &str,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.disconnect", &self.instance)
+            .field("connection_id",      connection_id)
+            .field("bundle",             bundle)
+            .field("session_duration_us", session_duration_us)
+            .field("messages_sent",      messages_sent)
+            .field("anomalies_sent",     anomalies_sent)
+            .field("reason",             reason)
+    }
+
     pub fn query_slow(
         &self,
         request_id:       &str,
@@ -619,60 +718,6 @@ impl Logger {
             .field("sigma_level",         sigma_level)
             .field("contributing_fields", serde_json::json!(contributing_fields))
             .field("detection_source",    detection_source)
-    }
-
-    pub fn stream_subscribe(
-        &self,
-        connection_id: &str,
-        bundle:        &str,
-        client_ip:     &str,
-        mode:          &str,
-    ) -> LogEvent {
-        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.subscribe", &self.instance)
-            .field("connection_id", connection_id)
-            .field("bundle",        bundle)
-            .field("client_ip",     client_ip)
-            .field("mode",          mode)
-    }
-
-    pub fn stream_push(
-        &self,
-        connection_id: &str,
-        bundle:        &str,
-        message_seq:   u64,
-        duration_us:   u64,
-        bytes_sent:    u64,
-        k_global:      f64,
-        is_anomaly:    bool,
-        z_score:       f64,
-    ) -> LogEvent {
-        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.push", &self.instance)
-            .with_duration_us(duration_us)
-            .field("connection_id", connection_id)
-            .field("bundle",        bundle)
-            .field("message_seq",   message_seq)
-            .field("bytes_sent",    bytes_sent)
-            .field("k_global",      k_global)
-            .field("is_anomaly",    is_anomaly)
-            .field("z_score",       z_score)
-    }
-
-    pub fn stream_disconnect(
-        &self,
-        connection_id:     &str,
-        bundle:            &str,
-        session_duration_us: u64,
-        messages_sent:     u64,
-        anomalies_sent:    u64,
-        reason:            &str,
-    ) -> LogEvent {
-        LogEvent::new(LogLevel::Info, LogCategory::Stream, "stream.disconnect", &self.instance)
-            .field("connection_id",      connection_id)
-            .field("bundle",             bundle)
-            .field("session_duration_us",session_duration_us)
-            .field("messages_sent",      messages_sent)
-            .field("anomalies_sent",     anomalies_sent)
-            .field("reason",             reason)
     }
 
     pub fn audit(
@@ -1364,5 +1409,101 @@ mod tests {
         cfg.slow_query_threshold_us = 250_000;
         log.update_config(cfg);
         assert_eq!(log.slow_threshold_us(), 250_000);
+    }
+
+    // ── query.start ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_query_start_shape() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e = log.query_start("req-42", "gql", "DIVERGENCE FROM a TO b", "10.0.0.1", "curl/8.1");
+        let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
+        assert_eq!(j["event"],      "query.start");
+        assert_eq!(j["category"],   "query");
+        assert_eq!(j["level"],      "INFO");
+        assert_eq!(j["request_id"], "req-42");
+        assert_eq!(j["source"],     "gql");
+        assert_eq!(j["raw_gql"],    "DIVERGENCE FROM a TO b");
+        assert_eq!(j["client_ip"],  "10.0.0.1");
+        assert_eq!(j["user_agent"], "curl/8.1");
+        // No duration_us — query hasn't completed yet
+        assert!(j.get("duration_us").is_none() || j["duration_us"].is_null());
+        // No geometric block — haven't executed yet
+        assert!(j.get("geometric").is_none() || j["geometric"].is_null());
+    }
+
+    #[test]
+    fn test_query_start_different_request_ids() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e1 = log.query_start("req-1", "gql", "SELECT * FROM a", "127.0.0.1", "");
+        let e2 = log.query_start("req-2", "gql", "SELECT * FROM b", "127.0.0.1", "");
+        let j1: Value = serde_json::from_str(&e1.serialize_json()).unwrap();
+        let j2: Value = serde_json::from_str(&e2.serialize_json()).unwrap();
+        assert_ne!(j1["request_id"], j2["request_id"]);
+    }
+
+    // ── stream events ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stream_subscribe_shape() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e = log.stream_subscribe("ws_abc123", "sensor_das", "10.0.0.1", "dashboard");
+        let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
+        assert_eq!(j["event"],         "stream.subscribe");
+        assert_eq!(j["category"],      "stream");
+        assert_eq!(j["level"],         "INFO");
+        assert_eq!(j["connection_id"], "ws_abc123");
+        assert_eq!(j["bundle"],        "sensor_das");
+        assert_eq!(j["client_ip"],     "10.0.0.1");
+        assert_eq!(j["mode"],          "dashboard");
+    }
+
+    #[test]
+    fn test_stream_push_shape() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e = log.stream_push("ws_abc123", "sensor_das", 142, 884, 312, 0.021, false, 0.41);
+        let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
+        assert_eq!(j["event"],         "stream.push");
+        assert_eq!(j["category"],      "stream");
+        assert_eq!(j["connection_id"], "ws_abc123");
+        assert_eq!(j["bundle"],        "sensor_das");
+        assert_eq!(j["message_seq"],   142);
+        assert_eq!(j["bytes_sent"],    312);
+        assert_eq!(j["is_anomaly"],    false);
+        assert!((j["k_global"].as_f64().unwrap() - 0.021).abs() < 1e-9);
+        assert!((j["z_score"].as_f64().unwrap() - 0.41).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stream_anomaly_push_shape() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e = log.stream_anomaly_push(
+            "ws_abc123", "sensor_das", 198, 0.089, 0.045, 3.72,
+            &["pressure".to_string(), "temp".to_string()], 1022,
+        );
+        let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
+        assert_eq!(j["event"],        "stream.anomaly_push");
+        assert_eq!(j["category"],     "stream");
+        assert_eq!(j["level"],        "WARN");
+        assert_eq!(j["is_anomaly"],   true);
+        assert_eq!(j["message_seq"],  198);
+        assert!((j["z_score"].as_f64().unwrap() - 3.72).abs() < 1e-9);
+        let fields = j["contributing_fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], "pressure");
+    }
+
+    #[test]
+    fn test_stream_disconnect_shape() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let e = log.stream_disconnect("ws_abc123", "sensor_das", 1_802_441, 201, 3, "client_close");
+        let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
+        assert_eq!(j["event"],              "stream.disconnect");
+        assert_eq!(j["category"],           "stream");
+        assert_eq!(j["connection_id"],      "ws_abc123");
+        assert_eq!(j["session_duration_us"], 1_802_441);
+        assert_eq!(j["messages_sent"],      201);
+        assert_eq!(j["anomalies_sent"],     3);
+        assert_eq!(j["reason"],             "client_close");
     }
 }

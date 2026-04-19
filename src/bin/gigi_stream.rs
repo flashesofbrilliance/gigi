@@ -4223,6 +4223,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
 
     let (mut sender, mut receiver) = socket.split();
 
+    // Unique connection ID for this WebSocket session
+    let connection_id = format!("ws_{}", &new_request_id()[..8]);
+    let ws_t0 = std::time::Instant::now();
+    let mut messages_sent: u64 = 0;
+    let mut anomalies_sent: u64 = 0;
+
     // Active subscriptions for this connection: bundle_name → Subscription
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
 
@@ -4243,7 +4249,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         let response = handle_ws_command(
-                            &text, &state, &mut subscriptions
+                            &text, &state, &mut subscriptions, &connection_id
                         ).await;
                         if !response.is_empty() {
                             if sender.send(WsMessage::Text(response.into())).await.is_err() {
@@ -4277,13 +4283,22 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
                                         if !passes { continue; }
                                     }
                                 }
+                                let push_t0 = std::time::Instant::now();
                                 let frame = format!(
                                     "EVENT {} {} {} K={:.6}",
                                     event.bundle, event.op, event.record_json, event.curvature
                                 );
+                                let bytes_sent = frame.len() as u64;
                                 if push_tx.send(frame).is_err() {
                                     break;
                                 }
+                                let dur = push_t0.elapsed().as_micros() as u64;
+                                messages_sent += 1;
+                                let ev = state.logger.stream_push(
+                                    &connection_id, bundle_name, messages_sent,
+                                    dur, bytes_sent, event.curvature, false, 0.0,
+                                );
+                                state.logger.emit(ev);
                             }
                             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
@@ -4304,6 +4319,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
                 }
             }
         }
+    }
+
+    // Emit stream.disconnect for every active subscription on exit
+    let session_us = ws_t0.elapsed().as_micros() as u64;
+    for bundle_name in subscriptions.keys() {
+        let ev = state.logger.stream_disconnect(
+            &connection_id, bundle_name, session_us,
+            messages_sent, anomalies_sent, "client_close",
+        );
+        state.logger.emit(ev);
     }
 }
 
@@ -4370,6 +4395,7 @@ async fn handle_ws_command(
     cmd: &str,
     state: &Arc<StreamState>,
     subscriptions: &mut HashMap<String, Subscription>,
+    connection_id: &str,
 ) -> String {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     if parts.is_empty() {
@@ -4417,6 +4443,11 @@ async fn handle_ws_command(
                 },
             );
             let filter_count = subscriptions[&bundle_name].filters.len();
+
+            // Spec §3.5: emit stream.subscribe
+            let ev = state.logger.stream_subscribe(connection_id, &bundle_name, "", "subscribe");
+            state.logger.emit(ev);
+
             format!("SUBSCRIBED {} filters={}", bundle_name, filter_count)
         }
 
@@ -4776,10 +4807,15 @@ async fn update_log_config(
 
 async fn gql_query(
     State(state): State<Arc<StreamState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let t0 = Instant::now();
     let req_id = new_request_id();
+    let user_agent = headers.get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
     let query = match body.get("query").and_then(|v| v.as_str()) {
         Some(q) => q,
@@ -4794,6 +4830,12 @@ async fn gql_query(
             )
         }
     };
+
+    // Spec §3.1: emit query.start before parsing — lets operators detect crashed/hung queries
+    {
+        let ev = state.logger.query_start(&req_id, "gql", query, "", &user_agent);
+        state.logger.emit(ev);
+    }
 
     let stmt = match gigi::parser::parse(query) {
         Ok(s) => s,
