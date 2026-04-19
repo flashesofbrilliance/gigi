@@ -1010,6 +1010,58 @@ async fn health(State(state): State<Arc<StreamState>>) -> (StatusCode, Json<Heal
     }
 }
 
+/// Build a Prometheus text exposition body from pre-computed metric values.
+/// Extracted as a pure function so it can be unit-tested without an axum server.
+#[allow(clippy::too_many_arguments)]
+fn build_prometheus_text(
+    queries_total: u64, errors_total: u64, slow_total: u64,
+    p50: u64, p95: u64, p99: u64,
+    records_total: u64, bytes_total: u64,
+    anomalies: u64, bundle_count: usize, total_records: usize,
+    http_conns: u64, ws_conns: u64, uptime_secs: u64,
+) -> String {
+    format!(
+        "# HELP gigi_queries_total Total queries executed\n\
+         # TYPE gigi_queries_total counter\n\
+         gigi_queries_total {queries_total}\n\
+         # HELP gigi_queries_error_total Total failed queries\n\
+         # TYPE gigi_queries_error_total counter\n\
+         gigi_queries_error_total {errors_total}\n\
+         # HELP gigi_queries_slow_total Queries exceeding slow_query_threshold\n\
+         # TYPE gigi_queries_slow_total counter\n\
+         gigi_queries_slow_total {slow_total}\n\
+         # HELP gigi_query_duration_microseconds Query latency percentiles\n\
+         # TYPE gigi_query_duration_microseconds summary\n\
+         gigi_query_duration_microseconds{{quantile=\"0.5\"}} {p50}\n\
+         gigi_query_duration_microseconds{{quantile=\"0.95\"}} {p95}\n\
+         gigi_query_duration_microseconds{{quantile=\"0.99\"}} {p99}\n\
+         # HELP gigi_records_ingested_total Total records written\n\
+         # TYPE gigi_records_ingested_total counter\n\
+         gigi_records_ingested_total {records_total}\n\
+         # HELP gigi_bytes_ingested_total Total bytes written\n\
+         # TYPE gigi_bytes_ingested_total counter\n\
+         gigi_bytes_ingested_total {bytes_total}\n\
+         # HELP gigi_anomalies_detected_total Total anomalies detected\n\
+         # TYPE gigi_anomalies_detected_total counter\n\
+         gigi_anomalies_detected_total {anomalies}\n\
+         # HELP gigi_bundles Total bundles in engine\n\
+         # TYPE gigi_bundles gauge\n\
+         gigi_bundles {bundle_count}\n\
+         # HELP gigi_records_total Total records across all bundles\n\
+         # TYPE gigi_records_total gauge\n\
+         gigi_records_total {total_records}\n\
+         # HELP gigi_http_connections_total Total HTTP connections served\n\
+         # TYPE gigi_http_connections_total counter\n\
+         gigi_http_connections_total {http_conns}\n\
+         # HELP gigi_ws_connections_total Total WebSocket connections served\n\
+         # TYPE gigi_ws_connections_total counter\n\
+         gigi_ws_connections_total {ws_conns}\n\
+         # HELP gigi_uptime_seconds Server uptime\n\
+         # TYPE gigi_uptime_seconds gauge\n\
+         gigi_uptime_seconds {uptime_secs}\n"
+    )
+}
+
 /// GET /v1/metrics — live telemetry for operators, dashboards, and alerting.
 /// Accepts `Accept: text/plain` for Prometheus exposition format.
 async fn metrics_handler(
@@ -1039,45 +1091,12 @@ async fn metrics_handler(
         let http_conns     = m.http_connections_total.load(Ordering::Relaxed);
         let ws_conns       = m.ws_connections_total.load(Ordering::Relaxed);
 
-        let body = format!(
-            "# HELP gigi_queries_total Total queries executed\n\
-             # TYPE gigi_queries_total counter\n\
-             gigi_queries_total {queries_total}\n\
-             # HELP gigi_queries_error_total Total failed queries\n\
-             # TYPE gigi_queries_error_total counter\n\
-             gigi_queries_error_total {errors_total}\n\
-             # HELP gigi_queries_slow_total Queries exceeding slow_query_threshold\n\
-             # TYPE gigi_queries_slow_total counter\n\
-             gigi_queries_slow_total {slow_total}\n\
-             # HELP gigi_query_duration_microseconds Query latency percentiles\n\
-             # TYPE gigi_query_duration_microseconds summary\n\
-             gigi_query_duration_microseconds{{quantile=\"0.5\"}} {p50}\n\
-             gigi_query_duration_microseconds{{quantile=\"0.95\"}} {p95}\n\
-             gigi_query_duration_microseconds{{quantile=\"0.99\"}} {p99}\n\
-             # HELP gigi_records_ingested_total Total records written\n\
-             # TYPE gigi_records_ingested_total counter\n\
-             gigi_records_ingested_total {records_total}\n\
-             # HELP gigi_bytes_ingested_total Total bytes written\n\
-             # TYPE gigi_bytes_ingested_total counter\n\
-             gigi_bytes_ingested_total {bytes_total}\n\
-             # HELP gigi_anomalies_detected_total Total anomalies detected\n\
-             # TYPE gigi_anomalies_detected_total counter\n\
-             gigi_anomalies_detected_total {anomalies}\n\
-             # HELP gigi_bundles Total bundles in engine\n\
-             # TYPE gigi_bundles gauge\n\
-             gigi_bundles {bundle_count}\n\
-             # HELP gigi_records_total Total records across all bundles\n\
-             # TYPE gigi_records_total gauge\n\
-             gigi_records_total {total_records}\n\
-             # HELP gigi_http_connections_total Total HTTP connections served\n\
-             # TYPE gigi_http_connections_total counter\n\
-             gigi_http_connections_total {http_conns}\n\
-             # HELP gigi_ws_connections_total Total WebSocket connections served\n\
-             # TYPE gigi_ws_connections_total counter\n\
-             gigi_ws_connections_total {ws_conns}\n\
-             # HELP gigi_uptime_seconds Server uptime\n\
-             # TYPE gigi_uptime_seconds gauge\n\
-             gigi_uptime_seconds {uptime_secs}\n"
+        let body = build_prometheus_text(
+            queries_total, errors_total, slow_total,
+            p50, p95, p99,
+            records_total, bytes_total,
+            anomalies, bundle_count, total_records,
+            http_conns, ws_conns, uptime_secs,
         );
 
         return axum::response::Response::builder()
@@ -7328,5 +7347,52 @@ mod tests {
             let v = schema_coerce(&schema, field, Value::Null);
             assert!(matches!(v, Ok(Value::Null)), "Null must be accepted for {field}");
         }
+    }
+
+    // ── Prometheus text format ────────────────────────────────────────────────
+
+    #[test]
+    fn test_prometheus_text_contains_required_metric_names() {
+        let body = build_prometheus_text(100, 2, 1, 50_000, 200_000, 900_000,
+                                        5000, 250_000, 3, 7, 14_000, 88, 12, 3600);
+        for metric in &[
+            "gigi_queries_total",
+            "gigi_queries_error_total",
+            "gigi_queries_slow_total",
+            "gigi_query_duration_microseconds",
+            "gigi_records_ingested_total",
+            "gigi_bytes_ingested_total",
+            "gigi_anomalies_detected_total",
+            "gigi_bundles",
+            "gigi_records_total",
+            "gigi_http_connections_total",
+            "gigi_ws_connections_total",
+            "gigi_uptime_seconds",
+        ] {
+            assert!(body.contains(metric), "missing metric: {metric}");
+        }
+    }
+
+    #[test]
+    fn test_prometheus_text_values_correct() {
+        let body = build_prometheus_text(100, 2, 1, 50_000, 200_000, 900_000,
+                                        5000, 250_000, 3, 7, 14_000, 88, 12, 3600);
+        assert!(body.contains("gigi_queries_total 100"));
+        assert!(body.contains("gigi_queries_error_total 2"));
+        assert!(body.contains("gigi_queries_slow_total 1"));
+        assert!(body.contains(r#"gigi_query_duration_microseconds{quantile="0.5"} 50000"#));
+        assert!(body.contains(r#"gigi_query_duration_microseconds{quantile="0.95"} 200000"#));
+        assert!(body.contains(r#"gigi_query_duration_microseconds{quantile="0.99"} 900000"#));
+        assert!(body.contains("gigi_uptime_seconds 3600"));
+    }
+
+    #[test]
+    fn test_prometheus_text_has_help_and_type_lines() {
+        let body = build_prometheus_text(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        // Every metric must be preceded by # HELP and # TYPE
+        assert!(body.contains("# HELP gigi_queries_total"));
+        assert!(body.contains("# TYPE gigi_queries_total counter"));
+        assert!(body.contains("# HELP gigi_bundles"));
+        assert!(body.contains("# TYPE gigi_bundles gauge"));
     }
 }

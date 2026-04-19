@@ -1278,4 +1278,50 @@ mod tests {
         assert!(p50 >= 490_000 && p50 <= 510_000, "p50={p50}");
         assert!(p95 >= 930_000 && p95 <= 970_000, "p95={p95}");
     }
+
+    // ── Logger::get_config / update_config ────────────────────────────────────
+
+    #[test]
+    fn test_get_config_returns_defaults() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let cfg = log.get_config();
+        assert_eq!(cfg.slow_query_threshold_us, DEFAULT_SLOW_QUERY_US);
+        assert!(cfg.cat_query);
+        assert!(cfg.cat_audit);
+        assert!(!cfg.cat_connection); // off by default
+        assert!(cfg.stdout_enabled);
+    }
+
+    #[test]
+    fn test_update_config_applies_new_values() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let mut new_cfg = log.get_config();
+        new_cfg.slow_query_threshold_us = 500_000;
+        new_cfg.cat_connection = true;
+        new_cfg.stdout_enabled = false;
+        log.update_config(new_cfg);
+        let updated = log.get_config();
+        assert_eq!(updated.slow_query_threshold_us, 500_000);
+        assert!(updated.cat_connection);
+        assert!(!updated.stdout_enabled);
+    }
+
+    #[test]
+    fn test_update_config_cannot_disable_audit() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        let mut cfg = log.get_config();
+        cfg.cat_audit = false; // attempt to disable audit
+        log.update_config(cfg);
+        assert!(log.get_config().cat_audit, "audit must always be enabled");
+    }
+
+    #[test]
+    fn test_slow_threshold_us_reflects_update() {
+        let (log, _) = Logger::new(LogConfig::default(), inst());
+        assert_eq!(log.slow_threshold_us(), DEFAULT_SLOW_QUERY_US);
+        let mut cfg = log.get_config();
+        cfg.slow_query_threshold_us = 250_000;
+        log.update_config(cfg);
+        assert_eq!(log.slow_threshold_us(), 250_000);
+    }
 }
