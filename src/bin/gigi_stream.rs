@@ -133,7 +133,7 @@ impl StreamState {
         let data_dir = std::env::var("GIGI_DATA_DIR").unwrap_or_else(|_| "./gigi_data".to_string());
         let data_path = std::path::PathBuf::from(&data_dir);
 
-        let mut engine = match Engine::open_empty(&data_path) {
+        let engine = match Engine::open_empty(&data_path) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!(
@@ -144,7 +144,6 @@ impl StreamState {
             }
         };
 
-        init_system_bundles(&mut engine);
         eprintln!("  WAL persistence: {} ({})", data_path.display(), data_dir);
 
         StreamState {
@@ -6162,11 +6161,15 @@ async fn main() {
             match Engine::open_mmap(&data_dir_for_replay) {
                 Ok(mmap_engine) => {
                     let total = mmap_engine.total_records();
-                    *replay_state.engine.write().unwrap() = mmap_engine;
+                    {
+                        let mut eng = replay_state.engine.write().unwrap();
+                        *eng = mmap_engine;
+                        init_system_bundles(&mut eng);
+                    }
                     #[cfg(unix)]
                     unsafe { libc::malloc_trim(0); }
                     replay_state.ready.store(true, Ordering::Release);
-                    eprintln!("Engine ready — {total} records (fast path)");
+                    eprintln!("Engine ready — {total} records + _gigi_* system bundles (fast path)");
                     // Background: keep Tigris in sync with latest snapshot + WAL
                     if let Ok(bucket) = std::env::var("TIGRIS_BUCKET_NAME") {
                         let data_dir_clone = data_dir_for_replay.clone();
@@ -6200,6 +6203,7 @@ async fn main() {
                 if let Err(e) = engine.snapshot() {
                     eprintln!("Post-replay snapshot failed: {e}");
                     // Non-fatal: we keep running on heap. Mmap upgrade skipped.
+                    init_system_bundles(&mut engine);
                     drop(engine);
                     replay_state.ready.store(true, Ordering::Release);
                     eprintln!("Engine ready — running on heap (snapshot failed)");
@@ -6215,6 +6219,7 @@ async fn main() {
                 let total = mmap_engine.total_records();
                 let mut engine = replay_state.engine.write().unwrap();
                 *engine = mmap_engine;
+                init_system_bundles(&mut engine);
                 drop(engine);
 
                 // Force glibc to return freed heap pages to the OS.
@@ -6226,6 +6231,8 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Mmap reopen failed: {e} — keeping heap engine");
+                // init on the existing heap engine (which has replay data)
+                init_system_bundles(&mut replay_state.engine.write().unwrap());
             }
         }
 
