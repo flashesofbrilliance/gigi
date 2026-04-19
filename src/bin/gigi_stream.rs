@@ -6136,9 +6136,17 @@ async fn log_bundle_writer(
                     record.insert((*key).to_string(), log_json_to_value(v));
                 }
             }
-            for key in &["records_returned", "records_scanned", "kl_forward", "kl_reverse", "jensen_shannon"] {
+            for key in &["records_returned", "records_scanned"] {
                 if let Some(v) = event.payload.get(*key) {
                     record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+            // Geometric fields are nested under "geometric" block (spec §3.1)
+            if let Some(serde_json::Value::Object(geo)) = event.payload.get("geometric") {
+                for key in &["kl_forward", "kl_reverse", "jensen_shannon"] {
+                    if let Some(v) = geo.get(*key) {
+                        record.insert((*key).to_string(), log_json_to_value(v));
+                    }
                 }
             }
             // Normalise "bundles_accessed" array → single "bundle" text field.

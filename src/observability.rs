@@ -412,25 +412,28 @@ impl Logger {
             .field("cache_hit",         cache_hit)
             .field("slow",              slow);
 
-        // Geometric fields — always present, null when not computed
-        let e = match geo {
-            Some(g) => e
-                .field("kl_forward",     serde_json::json!(g.kl_forward))
-                .field("kl_reverse",     serde_json::json!(g.kl_reverse))
-                .field("jensen_shannon", serde_json::json!(g.jensen_shannon))
-                .field("fields_compared",serde_json::json!(g.fields_compared))
-                .field("ricci",          serde_json::json!(g.ricci))
-                .field("k_global",       serde_json::json!(g.k_global))
-                .field("coherence",      serde_json::json!(g.coherence)),
-            None => e
-                .field("kl_forward",     serde_json::Value::Null)
-                .field("kl_reverse",     serde_json::Value::Null)
-                .field("jensen_shannon", serde_json::Value::Null)
-                .field("fields_compared",serde_json::Value::Null)
-                .field("ricci",          serde_json::Value::Null)
-                .field("k_global",       serde_json::Value::Null)
-                .field("coherence",      serde_json::Value::Null),
+        // Spec §3.1: geometric fields nested under "geometric" block — GIGI's exclusive differentiator
+        let geo_block = match geo {
+            Some(g) => serde_json::json!({
+                "kl_forward":      g.kl_forward,
+                "kl_reverse":      g.kl_reverse,
+                "jensen_shannon":  g.jensen_shannon,
+                "fields_compared": g.fields_compared,
+                "ricci":           g.ricci,
+                "k_global":        g.k_global,
+                "coherence":       g.coherence,
+            }),
+            None => serde_json::json!({
+                "kl_forward":      null,
+                "kl_reverse":      null,
+                "jensen_shannon":  null,
+                "fields_compared": null,
+                "ricci":           null,
+                "k_global":        null,
+                "coherence":       null,
+            }),
         };
+        let e = e.field("geometric", geo_block);
 
         match error {
             Some(err) => e.field("error", err),
@@ -900,29 +903,44 @@ mod tests {
 
     #[test]
     fn test_geometric_null_fields_serialize_as_null_not_absent() {
-        // null must be PRESENT (not omitted) — enables counting queries without geo analysis
+        // null must be PRESENT inside "geometric" (not omitted, not at root)
+        // enables counting queries without geo analysis in dashboards
         let j: Value = serde_json::from_str(
             &LogEvent::new(LogLevel::Info, LogCategory::Query, "query.complete", inst())
-                .field("kl_forward",     Value::Null)
-                .field("jensen_shannon", Value::Null)
+                .field("geometric", serde_json::json!({
+                    "kl_forward":     null,
+                    "kl_reverse":     null,
+                    "jensen_shannon": null,
+                    "fields_compared":null,
+                    "ricci":          null,
+                    "k_global":       null,
+                    "coherence":      null
+                }))
                 .serialize_json()
         ).unwrap();
-        assert!(j.get("kl_forward").is_some(),     "kl_forward must be present as null");
-        assert!(j.get("jensen_shannon").is_some(),  "jensen_shannon must be present as null");
-        assert_eq!(j["kl_forward"], Value::Null);
+        let geo = &j["geometric"];
+        assert!(geo.is_object(),                       "geometric must be an object");
+        assert!(geo.get("kl_forward").is_some(),       "kl_forward must be present inside geometric");
+        assert!(geo.get("jensen_shannon").is_some(),    "jensen_shannon must be present inside geometric");
+        assert_eq!(geo["kl_forward"], Value::Null);
+        // Root must be clean
+        assert!(j.get("kl_forward").is_none(),         "kl_forward must NOT be at root");
     }
 
     #[test]
     fn test_geometric_values_round_trip() {
         let j: Value = serde_json::from_str(
             &LogEvent::new(LogLevel::Info, LogCategory::Query, "test", inst())
-                .field("kl_forward",     0.3944f64)
-                .field("jensen_shannon", 0.0647f64)
-                .field("fields_compared", 1u32)
+                .field("geometric", serde_json::json!({
+                    "kl_forward":     0.3944f64,
+                    "jensen_shannon": 0.0647f64,
+                    "fields_compared": 1u32
+                }))
                 .serialize_json()
         ).unwrap();
-        assert!((j["kl_forward"].as_f64().unwrap() - 0.3944).abs() < 1e-9);
-        assert_eq!(j["fields_compared"], 1);
+        let geo = &j["geometric"];
+        assert!((geo["kl_forward"].as_f64().unwrap() - 0.3944).abs() < 1e-9);
+        assert_eq!(geo["fields_compared"], 1);
     }
 
     // ── Timestamp ─────────────────────────────────────────────────────────────
@@ -1111,19 +1129,42 @@ mod tests {
         assert_eq!(j["cache_hit"],      true);
         assert_eq!(j["slow"],           false);
         assert_eq!(j["error"],          Value::Null);
-        assert!((j["kl_forward"].as_f64().unwrap() - 0.3944).abs() < 1e-9);
         assert_eq!(j["bundles_accessed"].as_array().unwrap().len(), 2);
         // No payload nesting
         assert!(j.get("payload").is_none());
+        // Spec §3.1: geometric fields MUST be in a nested "geometric" block
+        assert!(j.get("kl_forward").is_none(),     "kl_forward must NOT be at root");
+        assert!(j.get("jensen_shannon").is_none(),  "jensen_shannon must NOT be at root");
+        let geo = &j["geometric"];
+        assert!(geo.is_object(), "geometric must be an object");
+        assert!((geo["kl_forward"].as_f64().unwrap() - 0.3944).abs() < 1e-9);
+        assert!((geo["kl_reverse"].as_f64().unwrap() - 0.3762).abs() < 1e-9);
+        assert!((geo["jensen_shannon"].as_f64().unwrap() - 0.0647).abs() < 1e-9);
+        assert_eq!(geo["fields_compared"], 1);
+        assert_eq!(geo["ricci"],    Value::Null);
+        assert_eq!(geo["k_global"], Value::Null);
+        assert_eq!(geo["coherence"], Value::Null);
     }
 
     #[test]
-    fn test_query_complete_no_geo_has_null_fields() {
+    fn test_query_complete_no_geo_has_null_geometric_block() {
+        // Spec §1.1 §5: geometric fields null when not computed — still PRESENT as null nested block
         let (log, _) = Logger::new(LogConfig::default(), inst());
         let e = log.query_complete("r", "rest", "SELECT", "q", 100, 0, 100, &[], 0, 0, 0, 0, false, None, None);
         let j: Value = serde_json::from_str(&e.serialize_json()).unwrap();
-        assert_eq!(j["kl_forward"],     Value::Null);
-        assert_eq!(j["jensen_shannon"], Value::Null);
+        // Root must NOT have flat kl_forward etc.
+        assert!(j.get("kl_forward").is_none(),     "kl_forward must NOT be at root");
+        assert!(j.get("jensen_shannon").is_none(),  "jensen_shannon must NOT be at root");
+        // geometric block must exist and contain nulls
+        let geo = &j["geometric"];
+        assert!(geo.is_object(), "geometric block must be present even when null");
+        assert_eq!(geo["kl_forward"],     Value::Null);
+        assert_eq!(geo["kl_reverse"],     Value::Null);
+        assert_eq!(geo["jensen_shannon"], Value::Null);
+        assert_eq!(geo["fields_compared"],Value::Null);
+        assert_eq!(geo["ricci"],          Value::Null);
+        assert_eq!(geo["k_global"],       Value::Null);
+        assert_eq!(geo["coherence"],      Value::Null);
     }
 
     #[test]
