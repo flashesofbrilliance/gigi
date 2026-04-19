@@ -810,6 +810,88 @@ impl Logger {
             .field("wal_size_before", wal_size_before)
             .field("wal_size_after",  wal_size_after)
     }
+
+    pub fn wal_replay(
+        &self,
+        bundle:            &str,
+        records_recovered: u64,
+        duration_us:       u64,
+        triggered_by:      &str,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Wal, "wal.replay", &self.instance)
+            .with_duration_us(duration_us)
+            .field("bundle",            bundle)
+            .field("records_recovered", records_recovered)
+            .field("triggered_by",      triggered_by)
+    }
+
+    pub fn wal_compaction(
+        &self,
+        bundle:            &str,
+        segments_merged:   usize,
+        size_before:       u64,
+        size_after:        u64,
+        compression_ratio: f64,
+        duration_us:       u64,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Wal, "wal.compaction", &self.instance)
+            .with_duration_us(duration_us)
+            .field("bundle",            bundle)
+            .field("segments_merged",   segments_merged)
+            .field("size_before",       size_before)
+            .field("size_after",        size_after)
+            .field("compression_ratio", compression_ratio)
+    }
+
+    pub fn ingest_bulk(
+        &self,
+        bundle:        &str,
+        records:       u64,
+        bytes:         u64,
+        duration_us:   u64,
+        throughput_rps: f64,
+        wal_synced:    bool,
+        batches:       usize,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Ingest, "ingest.bulk", &self.instance)
+            .with_duration_us(duration_us)
+            .field("bundle",         bundle)
+            .field("records_written",records)
+            .field("bytes_written",  bytes)
+            .field("throughput_rps", throughput_rps)
+            .field("wal_synced",     wal_synced)
+            .field("batches",        batches)
+    }
+
+    pub fn connection_open(
+        &self,
+        protocol:  &str,
+        client_ip: &str,
+        user_agent: &str,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Connection, "connection.open", &self.instance)
+            .field("protocol",   protocol)
+            .field("client_ip",  client_ip)
+            .field("user_agent", user_agent)
+    }
+
+    pub fn connection_close(
+        &self,
+        protocol:            &str,
+        client_ip:           &str,
+        session_duration_us: u64,
+        requests_served:     u64,
+        bytes_sent:          u64,
+        bytes_received:      u64,
+    ) -> LogEvent {
+        LogEvent::new(LogLevel::Info, LogCategory::Connection, "connection.close", &self.instance)
+            .field("protocol",            protocol)
+            .field("client_ip",           client_ip)
+            .field("session_duration_us", session_duration_us)
+            .field("requests_served",     requests_served)
+            .field("bytes_sent",          bytes_sent)
+            .field("bytes_received",      bytes_received)
+    }
 }
 
 // ── LogIngester ───────────────────────────────────────────────────────────────

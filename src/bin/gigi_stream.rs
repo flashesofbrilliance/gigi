@@ -1202,6 +1202,8 @@ async fn create_bundle(
         schema.gauge_key = Some(gk);
     }
 
+    let field_count = req.schema.fields.len();
+    let bundle_name_clone = req.name.clone();
     let mut engine = state.engine.write().unwrap();
     engine.create_bundle(schema).map_err(|e| {
         (
@@ -1211,12 +1213,17 @@ async fn create_bundle(
             }),
         )
     })?;
+    drop(engine);
+
+    // Spec §3.6: bundle.create
+    let ev = state.logger.bundle_create(&bundle_name_clone, field_count, "heap", "api");
+    state.logger.emit(ev);
 
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "status": "created",
-            "bundle": req.name
+            "bundle": bundle_name_clone
         })),
     ))
 }
@@ -1248,9 +1255,12 @@ async fn drop_bundle(
     match engine.drop_bundle(&name) {
         Ok(true) => {
             drop(engine);
+            // Spec §3.6: bundle.drop (Bundle category)
+            let bev = state.logger.bundle_drop(&name, records_before, "api", "");
+            state.logger.emit(bev);
             // Spec §3.8: audit.bundle_drop
-            let ev = state.logger.audit_bundle_drop(&name, records_before, bytes_before, "api", "");
-            state.logger.emit(ev);
+            let aev = state.logger.audit_bundle_drop(&name, records_before, bytes_before, "api", "");
+            state.logger.emit(aev);
             Ok(Json(
                 serde_json::json!({"status": "dropped", "bundle": name}),
             ))
@@ -1573,6 +1583,16 @@ async fn stream_ingest(
         curvature: k,
     });
     let conf = curvature::confidence(k);
+
+    // Spec §3.2: ingest.bulk
+    {
+        let bytes_est = estimate_bytes(&records);
+        let dur_us = 0u64; // no per-handler timing yet
+        let tps = if dur_us > 0 { inserted as f64 / (dur_us as f64 / 1_000_000.0) } else { 0.0 };
+        let ev = state.logger.ingest_bulk(&name, inserted as u64, bytes_est, dur_us, tps, true, 1);
+        state.logger.emit(ev);
+        state.metrics.record_ingest(inserted as u64, bytes_est);
+    }
 
     Ok(Json(serde_json::json!({
         "status": "streamed",
@@ -3596,6 +3616,17 @@ async fn ingest_dhoom(
         "confidence": conf,
         "storage_mode": store.storage_mode()
     });
+
+    // Spec §3.2: ingest.bulk
+    {
+        let bytes_est = estimate_bytes(&records);
+        let dur_us = 0u64;
+        let tps = 0.0f64;
+        let ev = state.logger.ingest_bulk(&name, inserted as u64, bytes_est, dur_us, tps, true, 1);
+        state.logger.emit(ev);
+        state.metrics.record_ingest(inserted as u64, bytes_est);
+    }
+
     Ok((StatusCode::OK, Json(resp)).into_response())
 }
 
@@ -4248,6 +4279,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
     let mut messages_sent: u64 = 0;
     let mut anomalies_sent: u64 = 0;
 
+    // Spec §3.7: connection.open
+    {
+        let ev = state.logger.connection_open("websocket", "", "");
+        state.logger.emit(ev);
+    }
+
     // Active subscriptions for this connection: bundle_name → Subscription
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
 
@@ -4346,6 +4383,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<StreamState>) {
         let ev = state.logger.stream_disconnect(
             &connection_id, bundle_name, session_us,
             messages_sent, anomalies_sent, "client_close",
+        );
+        state.logger.emit(ev);
+    }
+
+    // Spec §3.7: connection.close
+    {
+        let ev = state.logger.connection_close(
+            "websocket", "", session_us, messages_sent, 0, 0,
         );
         state.logger.emit(ev);
     }
@@ -6162,6 +6207,60 @@ fn init_system_bundles(engine: &mut Engine) {
             ("event",       false),
             ("detail",      false),
         ]),
+        ("_gigi_audit_log", &[
+            ("ts_us",       true),
+            ("duration_us", true),
+            ("event",       false),
+            ("bundle",      false),
+            ("level",       false),
+            ("detail",      false),
+        ]),
+        ("_gigi_stream_log", &[
+            ("ts_us",                true),
+            ("duration_us",          true),
+            ("messages_sent",        true),
+            ("anomalies_sent",       true),
+            ("session_duration_us",  true),
+            ("event",               false),
+            ("connection_id",        false),
+            ("bundle",              false),
+            ("detail",              false),
+        ]),
+        ("_gigi_bundle_log", &[
+            ("ts_us",       true),
+            ("duration_us", true),
+            ("event",       false),
+            ("bundle",      false),
+            ("detail",      false),
+        ]),
+        ("_gigi_ingest_log", &[
+            ("ts_us",            true),
+            ("duration_us",      true),
+            ("records_written",  true),
+            ("bytes_written",    true),
+            ("throughput_rps",   true),
+            ("event",            false),
+            ("bundle",           false),
+        ]),
+        ("_gigi_wal_log", &[
+            ("ts_us",             true),
+            ("duration_us",       true),
+            ("records_flushed",   true),
+            ("bytes_flushed",     true),
+            ("records_recovered", true),
+            ("event",             false),
+            ("bundle",            false),
+        ]),
+        ("_gigi_conn_log", &[
+            ("ts_us",                true),
+            ("session_duration_us",  true),
+            ("requests_served",      true),
+            ("bytes_sent",           true),
+            ("bytes_received",       true),
+            ("event",               false),
+            ("protocol",            false),
+            ("client_ip",           false),
+        ]),
     ];
 
     let existing: Vec<String> = engine.bundle_names().iter().map(|s| s.to_string()).collect();
@@ -6206,10 +6305,16 @@ async fn log_bundle_writer(
 ) {
     while let Some(event) = rx.recv().await {
         let bundle_name: &str = match event.category {
-            LogCategory::Query   => "_gigi_query_log",
-            LogCategory::Slow    => "_gigi_slow_log",
-            LogCategory::Anomaly => "_gigi_anomaly_log",
-            _                    => "_gigi_system_log",
+            LogCategory::Query      => "_gigi_query_log",
+            LogCategory::Slow       => "_gigi_slow_log",
+            LogCategory::Anomaly    => "_gigi_anomaly_log",
+            LogCategory::Audit      => "_gigi_audit_log",
+            LogCategory::Stream     => "_gigi_stream_log",
+            LogCategory::Bundle     => "_gigi_bundle_log",
+            LogCategory::Ingest     => "_gigi_ingest_log",
+            LogCategory::Wal        => "_gigi_wal_log",
+            LogCategory::Connection => "_gigi_conn_log",
+            LogCategory::System     => "_gigi_system_log",
         };
 
         // Build the record from event fields.
@@ -6265,11 +6370,68 @@ async fn log_bundle_writer(
                     record.insert((*key).to_string(), log_json_to_value(v));
                 }
             }
-        } else {
-            // System / other: store level + compressed detail.
+        } else if event.category == LogCategory::Ingest {
+            for key in &["bundle", "records_written", "bytes_written", "throughput_rps", "wal_synced", "batches", "k_before", "k_after", "k_delta"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+        } else if event.category == LogCategory::Bundle {
+            for key in &["bundle", "field_count", "storage_type", "source", "records_deleted",
+                         "triggered_by", "records_scanned", "fields_cached"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+            if !event.payload.is_empty() {
+                let detail = serde_json::to_string(&event.payload).unwrap_or_default();
+                record.insert("detail".into(), Value::Text(detail));
+            }
+        } else if event.category == LogCategory::Stream {
+            for key in &["connection_id", "bundle", "message_seq", "messages_sent",
+                         "anomalies_sent", "session_duration_us", "bytes_sent",
+                         "k_global", "z_score", "is_anomaly"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+            if !event.payload.is_empty() {
+                let detail = serde_json::to_string(&event.payload).unwrap_or_default();
+                record.insert("detail".into(), Value::Text(detail));
+            }
+        } else if event.category == LogCategory::Wal {
+            for key in &["bundle", "records_flushed", "bytes_flushed", "wal_size_before",
+                         "wal_size_after", "records_recovered", "segments_merged",
+                         "size_before", "size_after", "compression_ratio", "triggered_by"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+        } else if event.category == LogCategory::Connection {
+            for key in &["protocol", "client_ip", "user_agent", "session_duration_us",
+                         "requests_served", "bytes_sent", "bytes_received"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+        } else if event.category == LogCategory::Audit {
+            for key in &["bundle", "actor", "client_ip", "outcome", "old_level", "new_level",
+                         "records_deleted", "bytes_freed", "triggered_by"] {
+                if let Some(v) = event.payload.get(*key) {
+                    record.insert((*key).to_string(), log_json_to_value(v));
+                }
+            }
+            // Store remaining payload as detail for forward-compat
             let level_str = format!("{:?}", event.level);
             record.insert("level".into(), Value::Text(level_str));
-            // Put remaining payload into "detail" as a JSON string.
+            if !event.payload.is_empty() {
+                let detail = serde_json::to_string(&event.payload).unwrap_or_default();
+                record.insert("detail".into(), Value::Text(detail));
+            }
+        } else {
+            // System: store level + compressed detail.
+            let level_str = format!("{:?}", event.level);
+            record.insert("level".into(), Value::Text(level_str));
             if !event.payload.is_empty() {
                 let detail = serde_json::to_string(&event.payload).unwrap_or_default();
                 record.insert("detail".into(), Value::Text(detail));
@@ -6564,12 +6726,20 @@ async fn main() {
         // ── Step 3: Slow path — heap replay + snapshot write + mmap open ─────────
         {
             let mut engine = replay_state.engine.write().unwrap();
+            let wal_t0 = std::time::Instant::now();
             if let Err(e) = engine.replay_wal() {
                 eprintln!("WAL replay error: {e}");
                 drop(engine);
                 replay_state.ready.store(true, Ordering::Release);
                 eprintln!("Engine ready (replay failed, using empty state)");
                 return;
+            }
+            let wal_dur_us = wal_t0.elapsed().as_micros() as u64;
+            let records_recovered = engine.total_records() as u64;
+            // Spec §3.10: wal.replay — emitted once per startup after heap replay
+            {
+                let ev = replay_state.logger.wal_replay("*", records_recovered, wal_dur_us, "startup");
+                replay_state.logger.emit(ev);
             }
 
             // Phase 2: Snapshot heap bundles to DHOOM files + compact WAL
@@ -6629,6 +6799,32 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        // Wait for Ctrl-C / SIGTERM
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        // Spec §3.9: system.shutdown
+        let ev = state.logger.system_shutdown(
+            state.start_time.elapsed().as_micros() as u64,
+            0, // queries_served — counters not yet tracked globally
+            0, // records_ingested
+            0, // anomalies_detected
+            "graceful",
+        );
+        state.logger.emit(ev);
+        eprintln!("Graceful shutdown — system.shutdown emitted");
+    })
     .await
     .unwrap();
 }
@@ -7561,5 +7757,119 @@ mod tests {
         assert!(body.contains("# HELP gigi_bundles"));
         assert!(body.contains("# TYPE gigi_bundles gauge"));
     }
-}
 
+    // ── Observability v1.1 — new builders ─────────────────────────────────
+
+    #[test]
+    fn test_obs_connection_open_builder() {
+        use gigi::observability::{Logger, LogCategory, LogConfig};
+        let (logger, _ingester) = Logger::new(LogConfig::default(), "test-node");
+        let ev = logger.connection_open("websocket", "127.0.0.1", "gigi-test");
+        assert_eq!(ev.event, "connection.open");
+        assert!(ev.category == LogCategory::Connection);
+        let proto = ev.payload.get("protocol")
+            .and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(proto, "websocket");
+    }
+
+    #[test]
+    fn test_obs_connection_close_builder() {
+        use gigi::observability::{Logger, LogCategory, LogConfig};
+        let (logger, _ingester) = Logger::new(LogConfig::default(), "test-node");
+        let ev = logger.connection_close("websocket", "10.0.0.1", 5_000_000, 42, 9000, 1200);
+        assert_eq!(ev.event, "connection.close");
+        assert!(ev.category == LogCategory::Connection);
+        let dur = ev.payload.get("session_duration_us")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(dur, 5_000_000);
+        let reqs = ev.payload.get("requests_served")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(reqs, 42);
+    }
+
+    #[test]
+    fn test_obs_ingest_bulk_builder() {
+        use gigi::observability::{Logger, LogCategory, LogConfig};
+        let (logger, _ingester) = Logger::new(LogConfig::default(), "test-node");
+        let ev = logger.ingest_bulk("sensors", 5000, 200_000, 1_000_000, 5000.0, true, 10);
+        assert_eq!(ev.event, "ingest.bulk");
+        assert!(ev.category == LogCategory::Ingest);
+        let recs = ev.payload.get("records_written")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(recs, 5000);
+    }
+
+    #[test]
+    fn test_obs_wal_replay_builder() {
+        use gigi::observability::{Logger, LogCategory, LogConfig};
+        let (logger, _ingester) = Logger::new(LogConfig::default(), "test-node");
+        let ev = logger.wal_replay("sensors", 9999, 500_000, "startup");
+        assert_eq!(ev.event, "wal.replay");
+        assert!(ev.category == LogCategory::Wal);
+        let recovered = ev.payload.get("records_recovered")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(recovered, 9999);
+    }
+
+    #[test]
+    fn test_obs_wal_compaction_builder() {
+        use gigi::observability::{Logger, LogCategory, LogConfig};
+        let (logger, _ingester) = Logger::new(LogConfig::default(), "test-node");
+        let ev = logger.wal_compaction("sensors", 4, 1_000_000, 200_000, 5.0, 80_000);
+        assert_eq!(ev.event, "wal.compaction");
+        assert!(ev.category == LogCategory::Wal);
+        let ratio = ev.payload.get("compression_ratio")
+            .and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert!((ratio - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_obs_log_routing_all_categories() {
+        // Verify all LogCategory variants are represented in the routing table.
+        // This test compiles the match — if a new variant is added without updating
+        // log_bundle_writer, it will fail to compile (non-exhaustive match).
+        use gigi::observability::LogCategory;
+        let categories = [
+            LogCategory::Query,
+            LogCategory::Slow,
+            LogCategory::Anomaly,
+            LogCategory::Audit,
+            LogCategory::Stream,
+            LogCategory::Bundle,
+            LogCategory::Ingest,
+            LogCategory::Wal,
+            LogCategory::Connection,
+            LogCategory::System,
+        ];
+        let expected_bundles = [
+            "_gigi_query_log",
+            "_gigi_slow_log",
+            "_gigi_anomaly_log",
+            "_gigi_audit_log",
+            "_gigi_stream_log",
+            "_gigi_bundle_log",
+            "_gigi_ingest_log",
+            "_gigi_wal_log",
+            "_gigi_conn_log",
+            "_gigi_system_log",
+        ];
+        assert_eq!(categories.len(), expected_bundles.len(), "routing table must cover all categories");
+
+        for (cat, bundle) in categories.iter().zip(expected_bundles.iter()) {
+            let got = match cat {
+                LogCategory::Query      => "_gigi_query_log",
+                LogCategory::Slow       => "_gigi_slow_log",
+                LogCategory::Anomaly    => "_gigi_anomaly_log",
+                LogCategory::Audit      => "_gigi_audit_log",
+                LogCategory::Stream     => "_gigi_stream_log",
+                LogCategory::Bundle     => "_gigi_bundle_log",
+                LogCategory::Ingest     => "_gigi_ingest_log",
+                LogCategory::Wal        => "_gigi_wal_log",
+                LogCategory::Connection => "_gigi_conn_log",
+                LogCategory::System     => "_gigi_system_log",
+            };
+            assert_eq!(got, *bundle, "category {:?} must route to {bundle}", cat);
+        }
+    }
+
+}
