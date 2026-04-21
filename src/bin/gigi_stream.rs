@@ -5977,22 +5977,17 @@ fn execute_gql_on_store_read(
                     Ok(total_angle.abs() % (2.0 * std::f64::consts::PI))
                 };
 
-            // Note: we need two separate engine lookups; GaugeTest stores bundle1/bundle2 names,
-            // but in gigi_stream the 'store' is already bound to 'bundle' (the primary bundle).
-            // We re-look up both here directly from the engine reference.
-            // The `engine` binding is not available in this closure form, so we use
-            // store.records() for bundle1 and a secondary lookup for bundle2.
             let deficit1 = compute_deficit(store.records())?;
 
-            // bundle1 == bundle, bundle2 is the second bundle — look it up from the global engine
-            // (not available here). Fall back to parser::exec_statement for full two-bundle support.
-            // For the stream path, emit a placeholder with deficit1 only when bundle2 == bundle1.
             let deficit2 = if bundle2 == bundle1 {
                 deficit1
+            } else if let Some(eng) = engine {
+                let eng_read = eng.read().map_err(|_| "engine lock poisoned".to_string())?;
+                let store2 = eng_read.bundle(&bundle2)
+                    .ok_or_else(|| format!("GAUGE VS: bundle '{}' not found", bundle2))?;
+                compute_deficit(Box::new(store2.records()))?
             } else {
-                return Err(format!(
-                    "GAUGE VS: bundle '{}' lookup not supported in stream path; use the embedded engine", bundle2
-                ));
+                return Err(format!("GAUGE VS: bundle '{}' not found (no engine context)", bundle2));
             };
             let gauge_difference = (deficit1 - deficit2).abs();
             let gauge_invariant = gauge_difference < std::f64::consts::PI / 10.0;
