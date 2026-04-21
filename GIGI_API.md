@@ -1436,6 +1436,21 @@ HOLONOMY corpus NEAR (f11=1.0, f12=0.0) WITHIN 0.1 METRIC cosine ON FIBER (f11, 
 GAUGE corpus_en VS corpus_fr ON FIBER (f11, f12) AROUND tense_label;
 -- Returns: { bundle1, bundle2, holonomy_1, holonomy_2, gauge_difference, gauge_invariant }
 
+-- Distribution divergence between two bundles (VS alias)
+DIVERGENCE corpus_en VS corpus_fr;
+-- Returns: { bundle_a, bundle_b, kl_forward, kl_reverse, jensen_shannon, fields_compared, per_field }
+-- Also accepted: DIVERGENCE FROM corpus_en TO corpus_fr
+
+-- Batch insert-or-update
+SECTIONS sensors (42, 'Moscow', 'EU', 20240104, -31.9, 97.4, 2.2, ...) UPSERT;
+-- Each record: insert if key absent, update if present. Single WAL flush.
+
+-- Bundle with INVARIANT constraint (enforced on every insert/upsert)
+BUNDLE corpus
+  BASE (token_id NUMERIC)
+  FIBER (tense_label CATEGORICAL INDEX, f11 NUMERIC, f12 NUMERIC)
+  INVARIANT f11 * f11 + f12 * f12 = 1.0 +/- 0.05;
+
 -- List bundles
 SHOW BUNDLES;
 ```
@@ -1450,9 +1465,77 @@ SHOW BUNDLES;
 }
 ```
 
-**Response (CREATE / INSERT):**
+**Response (CREATE / INSERT / UPSERT):**
 ```json
 { "status": "ok" }
+```
+
+**Response shapes for fiber-geometric commands:**
+
+*SPECTRAL … ON FIBER … MODES k*
+```json
+{
+  "count": 3,
+  "rows": [
+    { "mode": 1, "lambda": 0.333, "ipr": 0.500 },
+    { "mode": 2, "lambda": 0.128, "ipr": 0.475 },
+    { "mode": 3, "lambda": 0.019, "ipr": 0.475 }
+  ]
+}
+```
+
+*TRANSPORT … FROM / TO*
+```json
+{
+  "count": 1,
+  "rows": [{
+    "displacement_0": -0.293, "displacement_1": 0.707,
+    "displacement_2": 0.0,    "displacement_3": 0.0,
+    "q0": 0.707, "q1": 0.707, "q2": 0.0, "q3": 0.0,
+    "transport_angle": 1.5707963
+  }]
+}
+```
+
+*HOLONOMY … ON FIBER (global)*
+```json
+{
+  "count": 5,
+  "rows": [
+    { "transport_angle": -3.14159, "w": 0.0, "x": 1.0 },
+    { "transport_angle":  1.5707,  "w": 0.5, "x": 0.5 },
+    { "_type": "summary", "holonomy_angle": 0.0, "holonomy_trivial": true }
+  ]
+}
+```
+
+*HOLONOMY … NEAR (local)*
+```json
+{ "local_holonomy_angle": 0.041, "neighbourhood_size": 12 }
+```
+
+*GAUGE … VS*
+```json
+{
+  "count": 1,
+  "rows": [{
+    "bundle1": "corpus_en", "bundle2": "corpus_fr",
+    "holonomy_1": 0.0, "holonomy_2": 0.0,
+    "gauge_difference": 0.0, "gauge_invariant": true
+  }]
+}
+```
+
+*DIVERGENCE … VS*
+```json
+{
+  "bundle_a": "corpus_en", "bundle_b": "corpus_fr",
+  "fields_compared": 4,
+  "jensen_shannon": 0.216,
+  "kl_forward":     0.696,
+  "kl_reverse":     1.551,
+  "per_field":      "w=0.003,x=0.224,y=0.468,z=0.000"
+}
 ```
 
 Returns `400` with `{ "error": "..." }` on parse errors.

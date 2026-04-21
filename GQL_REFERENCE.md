@@ -1,5 +1,5 @@
 # GQL — Geometric Query Language
-## Version 2.1 — Complete Reference
+## Version 2.2 — Complete Reference
 
 **Authors:** Bee Rosa Davis · Davis Geometric  
 **The query language for fiber bundle databases.**
@@ -42,7 +42,7 @@ SQL thinks in tables and rows. GQL thinks in bundles, sections, and fibers. Ever
 | ATLAS (transactions) | ✅ | BEGIN / COMMIT / ROLLBACK |
 | SHOW BUNDLES / DESCRIBE | ✅ | |
 | CURVATURE / RICCI / SPECTRAL | ✅ | |
-| DIVERGENCE FROM bundle_a TO bundle_b | ✅ | Gaussian KL + Jensen-Shannon between two bundles |
+| DIVERGENCE FROM bundle_a TO bundle_b (or VS) | ✅ | Gaussian KL + Jensen-Shannon between two bundles |
 | SPECTRAL … ON FIBER (…) MODES k | ✅ | Fiber-space Laplacian eigensolver — semantic cluster count |
 | TRANSPORT … FROM (…) TO (…) ON FIBER (…) | ✅ | Parallel transport rotation matrix between two records |
 | HOLONOMY … NEAR (…) WITHIN r ON FIBER (…) AROUND field | ✅ | Local holonomy in proximity neighbourhood |
@@ -249,6 +249,25 @@ BUNDLE sensors
 | NULLABLE | May be VOID (default) | — |
 | ENCRYPTED | Gauge-invariant encryption (GaugeKey) | — |
 
+**INVARIANT constraints:**
+
+Bundles may declare runtime invariants that GIGI enforces on every SECTION insert and UPSERT.
+
+```sql
+BUNDLE corpus
+  BASE (token_id NUMERIC)
+  FIBER (
+    tense_label CATEGORICAL INDEX,
+    f11 NUMERIC, f12 NUMERIC
+  )
+  INVARIANT f11 * f11 + f12 * f12 = 1.0 +/- 0.05;
+-- Any section where f11²+f12² ∉ [0.95, 1.05] is rejected.
+-- Multiple INVARIANT clauses are allowed.
+```
+
+The `+/-` tolerance specifies the half-width of the allowed band. Sections that violate
+an invariant are rejected with a structured error explaining which constraint failed.
+
 **Storage auto-detection:** Single arithmetic key → SEQUENTIAL (array, K=0). Composite → HASHED. Mostly arithmetic → HYBRID. The curvature of the base space determines the storage engine.
 
 **Bundle Options:**
@@ -354,6 +373,18 @@ SECTIONS sensors (
   44, 'Moscow', 'EU', 20240106, -22.1, 94.2, 3.1
 );
 -- Single WAL flush. Deferred field index. Batch curvature update.
+```
+
+### SECTIONS ... UPSERT — Batch insert-or-update ✅
+
+```sql
+SECTIONS sensors (
+  42, 'Moscow', 'EU', 20240104, -31.9, 97.4, 2.2,
+  43, 'Moscow', 'EU', 20240105, -30.3, 97.8, 1.8
+) UPSERT;
+-- Each record: insert if key absent, update if key present.
+-- Single WAL flush covering the entire batch.
+-- Response: { inserted: n, updated: m }
 ```
 
 ### SECTION ... UPSERT — Insert or update ✅
@@ -1122,6 +1153,9 @@ Computes Gaussian KL divergence and Jensen–Shannon divergence between two bund
 DIVERGENCE FROM sensor_das TO sensor_sonar;
 -- Compare numeric field distributions between two bundles
 -- Returns kl_forward, kl_reverse, jensen_shannon, fields_compared, per_field
+
+-- VS alias (ICARUS form) — equivalent to FROM ... TO:
+DIVERGENCE sensor_das VS sensor_sonar;
 
 DIVERGENCE FROM chembl_activities TO chembl_assays;
 -- Cross-domain divergence — fields_compared = 0 if no shared numeric fields
