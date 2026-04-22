@@ -130,68 +130,6 @@ This application claims priority to and incorporates by reference the following 
 
 %==============================================================================
 \newpage
-\section*{BRIEF DESCRIPTION OF THE DRAWINGS}
-%==============================================================================
-
-The accompanying drawings and tables, which are incorporated in and constitute a
-part of this specification, illustrate embodiments of the invention and together
-with the description serve to explain the principles of the invention.
-
-\begin{description}[leftmargin=2.2em, labelwidth=2em]
-  \item[\textbf{FIG.~1}] is a block diagram illustrating the GIGI system
-    architecture, showing the HTTP/WebSocket API layer, GQL execution engine,
-    fiber bundle storage engine, geometric write-ahead log~(WAL), and
-    memory-mapped persistence layer and their interconnections.
-
-  \item[\textbf{FIG.~2}] is a conceptual diagram of the fiber bundle data
-    model, illustrating the base space~$B$ (key space), fiber~$F$ (record
-    schema), total space~$E$ (all records), canonical projection
-    $\pi: E \!\to\! B$, and a section $\sigma: B \!\to\! E$ representing a
-    single record.
-
-  \item[\textbf{FIG.~3}] is a diagram illustrating the three bundle storage
-    modes---Sequential, Hashed, and Hybrid---and the automatic upgrade
-    thresholds between them.
-
-  \item[\textbf{FIG.~4}] is a diagram illustrating the holonomy polygon
-    computation: group centroids are placed as vertices of a polygon in
-    two-dimensional fiber space, and the discrete parallel transport deficit
-    $\delta\Phi = |\sum_k \theta_k| \bmod 2\pi$ is computed along the closed
-    path.
-
-  \item[\textbf{FIG.~5}] is a flowchart illustrating the GQL query execution
-    pipeline from client HTTP/WebSocket request through lexing, parsing,
-    semantic resolution, execution, and geometric result emission.
-
-  \item[\textbf{FIG.~6}] is a graph illustrating the curvature drift detection
-    mechanism, showing scalar curvature $K$ as a function of mutation index
-    with an anomaly threshold band derived from the rolling mean of
-    $|\Delta K|$.
-
-  \item[\textbf{TABLE~I}] is a reference table of the twenty-four GQL
-    operators defined in the GIGI query language, classified by kind
-    (geometric, diagnostic, analytic, or data-manipulation), and their
-    asymptotic time complexity.
-
-  \item[\textbf{TABLE~II}] is a performance validation table presenting
-    empirical benchmark results from the GIGI TPC-H benchmark suite,
-    reporting wall-clock time and per-row latency at four scale factors for
-    four canonical queries spanning filter-aggregation, grouped aggregation,
-    join with conditional aggregation, and three-way join.
-
-  \item[\textbf{TABLE~III}] is a feature comparison matrix contrasting GIGI
-    against relational databases~(SQL), graph databases, and vector databases
-    across fourteen geometric and analytical capabilities.
-
-  \item[\textbf{TABLE~IV}] is an example bundle data table illustrating the
-    \texttt{vitals} bundle schema with four fiber fields and three sample
-    records, together with the resulting scalar curvature~$K$ and
-    GIGI-hash~$\mathcal{H}$ for the bundle.
-\end{description}
-
-
-%==============================================================================
-\newpage
 \section*{SPECIFICATION}
 %==============================================================================
 
@@ -800,6 +738,67 @@ wherein curvature drift detection enables systematic data quality degradation to
 
 \end{enumerate}
 
+
+%==============================================================================
+\newpage
+\section*{BRIEF DESCRIPTION OF THE DRAWINGS}
+%==============================================================================
+
+The accompanying drawings and tables, which are incorporated in and constitute a
+part of this specification, illustrate embodiments of the invention and together
+with the description serve to explain the principles of the invention.
+
+\begin{description}[leftmargin=2.2em, labelwidth=2em]
+  \item[\textbf{FIG.~1}] is a block diagram illustrating the GIGI system
+    architecture, showing the HTTP/WebSocket API layer, GQL execution engine,
+    fiber bundle storage engine, geometric write-ahead log~(WAL), and
+    memory-mapped persistence layer and their interconnections.
+
+  \item[\textbf{FIG.~2}] is a conceptual diagram of the fiber bundle data
+    model, illustrating the base space~$B$ (key space), fiber~$F$ (record
+    schema), total space~$E$ (all records), canonical projection
+    $\pi: E \!\to\! B$, and a section $\sigma: B \!\to\! E$ representing a
+    single record.
+
+  \item[\textbf{FIG.~3}] is a diagram illustrating the three bundle storage
+    modes---Sequential, Hashed, and Hybrid---and the automatic upgrade
+    thresholds between them.
+
+  \item[\textbf{FIG.~4}] is a diagram illustrating the holonomy polygon
+    computation: group centroids are placed as vertices of a polygon in
+    two-dimensional fiber space, and the discrete parallel transport deficit
+    $\delta\Phi = |\sum_k \theta_k| \bmod 2\pi$ is computed along the closed
+    path.
+
+  \item[\textbf{FIG.~5}] is a flowchart illustrating the GQL query execution
+    pipeline from client HTTP/WebSocket request through lexing, parsing,
+    semantic resolution, execution, and geometric result emission.
+
+  \item[\textbf{FIG.~6}] is a graph illustrating the curvature drift detection
+    mechanism, showing scalar curvature $K$ as a function of mutation index
+    with an anomaly threshold band derived from the rolling mean of
+    $|\Delta K|$.
+
+  \item[\textbf{TABLE~I}] is a reference table of the twenty-four GQL
+    operators defined in the GIGI query language, classified by kind
+    (geometric, diagnostic, analytic, or data-manipulation), and their
+    asymptotic time complexity.
+
+  \item[\textbf{TABLE~II}] is a performance validation table presenting
+    empirical benchmark results from the GIGI TPC-H benchmark suite,
+    reporting wall-clock time and per-row latency at four scale factors for
+    four canonical queries spanning filter-aggregation, grouped aggregation,
+    join with conditional aggregation, and three-way join.
+
+  \item[\textbf{TABLE~III}] is a feature comparison matrix contrasting GIGI
+    against relational databases~(SQL), graph databases, and vector databases
+    across fourteen geometric and analytical capabilities.
+
+  \item[\textbf{TABLE~IV}] is an example bundle data table illustrating the
+    \texttt{vitals} bundle schema with four fiber fields and three sample
+    records, together with the resulting scalar curvature~$K$ and
+    GIGI-hash~$\mathcal{H}$ for the bundle.
+\end{description}
 
 %==============================================================================
 \newpage
