@@ -6165,6 +6165,10 @@ fn get_bundle_name(stmt: &gigi::parser::Statement) -> Option<String> {
         Why { bundle, .. } => Some(bundle.clone()),
         Implications { bundle, .. } => Some(bundle.clone()),
         Ricci { bundle, .. } => Some(bundle.clone()),
+        // Sprint H: PROJECT INVARIANT routes through the standard
+        // single-bundle read path; expose its bundle name here so the
+        // dispatcher knows where to attach.
+        ProjectInvariant { bundle, .. } => Some(bundle.clone()),
         // Divergence is cross-bundle; no single name
         _ => None,
     }
