@@ -46,6 +46,10 @@ pub enum Statement {
         encrypted: bool,
         adjacencies: Vec<AdjacencySpec>,
         invariants: Vec<InvariantSpec>,
+        /// v0.2: source of the master seed used to derive the GaugeKey.
+        /// Defaults to `Random` (server CSPRNG); `WITH ENCRYPTION SEED 'hex'`
+        /// or `WITH ENCRYPTION SEED FROM ENV $NAME` overrides.
+        seed_source: crate::types::EncryptionSeedSource,
     },
     Collapse {
         bundle: String,
@@ -516,6 +520,10 @@ pub struct FieldSpec {
     /// the parser fills this with `EncryptionMode::default_for_type` after
     /// the field type is known.
     pub encryption: crate::types::EncryptionMode,
+    /// v0.2 (Sprint E): isometric group name. Set when the field declares
+    /// `ENCRYPTED ISOMETRIC GROUP <name>`. Fields sharing a group are encrypted
+    /// jointly with one shared O(k) matrix.
+    pub encryption_group: Option<String>,
 }
 
 /// Parsed invariant constraint: INVARIANT field = value +/- tol
@@ -1072,6 +1080,7 @@ impl Parser {
         }
 
         let invariants = self.parse_invariant_specs();
+        let seed_source = self.parse_optional_encryption_seed_clause()?;
 
         Ok(Statement::CreateBundle {
             name,
@@ -1081,7 +1090,64 @@ impl Parser {
             encrypted,
             adjacencies,
             invariants,
+            seed_source,
         })
+    }
+
+    /// Parse `WITH ENCRYPTION SEED 'hex'` or `WITH ENCRYPTION SEED FROM ENV $NAME`
+    /// if present after the field list. Returns the chosen source, defaulting to
+    /// `Random` when no clause appears (v0.1 backwards-compat).
+    fn parse_optional_encryption_seed_clause(
+        &mut self,
+    ) -> Result<crate::types::EncryptionSeedSource, String> {
+        if !self.is_keyword("WITH") {
+            return Ok(crate::types::EncryptionSeedSource::Random);
+        }
+        // Peek ahead: WITH ENCRYPTION SEED ...
+        // If the next-next word isn't ENCRYPTION, leave the WITH for someone
+        // else (defensive — other CREATE BUNDLE extensions might use WITH).
+        // For now, if WITH is present, we expect ENCRYPTION SEED to follow.
+        self.advance(); // consume WITH
+        if !self.is_keyword("ENCRYPTION") {
+            return Err("Expected ENCRYPTION after WITH in CREATE BUNDLE".to_string());
+        }
+        self.advance();
+        if !self.is_keyword("SEED") {
+            return Err("Expected SEED after ENCRYPTION".to_string());
+        }
+        self.advance();
+
+        if self.is_keyword("FROM") {
+            self.advance();
+            if !self.is_keyword("ENV") {
+                return Err("Expected ENV after FROM in WITH ENCRYPTION SEED FROM ENV".to_string());
+            }
+            self.advance();
+            // Env var name: a bare word (e.g. JG_GIGI_SEED).
+            let env_name = self.expect_word()?;
+            return Ok(crate::types::EncryptionSeedSource::Env(env_name));
+        }
+
+        // Otherwise expect a hex literal (string in single quotes).
+        match self.advance() {
+            Some(Token::Str(hex)) => {
+                if hex.len() != 64 {
+                    return Err(format!(
+                        "WITH ENCRYPTION SEED hex must be 64 characters (32 bytes), got {}",
+                        hex.len()
+                    ));
+                }
+                if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(
+                        "WITH ENCRYPTION SEED hex must contain only [0-9a-fA-F]".to_string(),
+                    );
+                }
+                Ok(crate::types::EncryptionSeedSource::Hex(hex))
+            }
+            other => Err(format!(
+                "Expected 64-char hex string or FROM ENV after WITH ENCRYPTION SEED, got {other:?}"
+            )),
+        }
     }
 
     /// Parse: name ON field = field WEIGHT w | name ON field WITHIN r WEIGHT w | name ON field ABOVE t WEIGHT w
@@ -1159,6 +1225,8 @@ impl Parser {
         // v0.2 per-field encryption mode. Defaults to None (plaintext) until
         // an `ENCRYPTED [MODE]` clause is seen on this field.
         let mut encryption = crate::types::EncryptionMode::None;
+        // v0.2 (Sprint E): isometric group name (Some only when ISOMETRIC GROUP <name>).
+        let mut encryption_group: Option<String> = None;
 
         loop {
             if self.is_keyword("RANGE") {
@@ -1197,7 +1265,9 @@ impl Parser {
                 // Optional explicit mode keyword (v0.2). If absent, the mode
                 // resolves to the type-default at schema-creation time
                 // (see Statement::CreateBundle dispatch).
-                encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                let (mode, group) = self.parse_encryption_mode_and_group(&ftype)?;
+                encryption = mode;
+                encryption_group = group;
             } else {
                 break;
             }
@@ -1212,6 +1282,7 @@ impl Parser {
             unique,
             required,
             encryption,
+            encryption_group,
         })
     }
 
@@ -1232,6 +1303,20 @@ impl Parser {
         &mut self,
         ftype: &str,
     ) -> Result<crate::types::EncryptionMode, String> {
+        // Backward-compat wrapper: drops the optional group name. Callers that
+        // need the group should call parse_encryption_mode_and_group instead.
+        let (mode, _group) = self.parse_encryption_mode_and_group(ftype)?;
+        Ok(mode)
+    }
+
+    /// v0.2 (Sprint E): same as `parse_encryption_mode_after_keyword` but also
+    /// returns the optional `GROUP <name>` clause that may follow `ISOMETRIC`.
+    /// Returns `(EncryptionMode, Option<String>)` where the group is `Some`
+    /// only for ISOMETRIC declarations that include `GROUP <name>`.
+    fn parse_encryption_mode_and_group(
+        &mut self,
+        ftype: &str,
+    ) -> Result<(crate::types::EncryptionMode, Option<String>), String> {
         let ftype_upper = ftype.to_ascii_uppercase();
         let is_numeric = matches!(
             ftype_upper.as_str(),
@@ -1249,10 +1334,10 @@ impl Parser {
                     "ENCRYPTED AFFINE requires a numeric field type; got {ftype}"
                 ));
             }
-            Ok(crate::types::EncryptionMode::Affine)
+            Ok((crate::types::EncryptionMode::Affine, None))
         } else if self.is_keyword("OPAQUE") {
             self.advance();
-            Ok(crate::types::EncryptionMode::Opaque)
+            Ok((crate::types::EncryptionMode::Opaque, None))
         } else if self.is_keyword("INDEXED") {
             self.advance();
             if !is_textish {
@@ -1260,7 +1345,7 @@ impl Parser {
                     "ENCRYPTED INDEXED is for high-cardinality TEXT/CATEGORICAL only; got {ftype}"
                 ));
             }
-            Ok(crate::types::EncryptionMode::Indexed)
+            Ok((crate::types::EncryptionMode::Indexed, None))
         } else if self.is_keyword("PROBABILISTIC") {
             self.advance();
             if !is_numeric {
@@ -1288,7 +1373,7 @@ impl Parser {
                     "SIGMA must be a positive number; got {sigma}"
                 ));
             }
-            Ok(crate::types::EncryptionMode::Probabilistic { sigma })
+            Ok((crate::types::EncryptionMode::Probabilistic { sigma }, None))
         } else if self.is_keyword("ISOMETRIC") {
             self.advance();
             if !is_numeric {
@@ -1296,7 +1381,18 @@ impl Parser {
                     "ENCRYPTED ISOMETRIC requires a numeric field type; got {ftype}"
                 ));
             }
-            Ok(crate::types::EncryptionMode::Isometric)
+            // Optional GROUP <name> clause. If absent, the field is its own
+            // singleton group (Sprint E degenerate case → falls back to
+            // Affine-like 1×1 identity matrix; still useful for distance
+            // tests but offers no joint protection).
+            let group = if self.is_keyword("GROUP") {
+                self.advance();
+                let g = self.expect_word()?;
+                Some(g)
+            } else {
+                None
+            };
+            Ok((crate::types::EncryptionMode::Isometric, group))
         } else {
             // No explicit mode — fall back to the type-default. For numeric
             // fields this is Affine (v0.1 path); for text/binary it's Opaque.
@@ -1308,7 +1404,7 @@ impl Parser {
                 }
                 _ => crate::types::EncryptionMode::Opaque,
             };
-            Ok(mode)
+            Ok((mode, None))
         }
     }
 
@@ -2041,6 +2137,7 @@ impl Parser {
                 unique: false,
                 required: false,
                 encryption: crate::types::EncryptionMode::None,
+                encryption_group: None,
             };
 
             if self.is_keyword("BASE") {
@@ -2050,26 +2147,34 @@ impl Parser {
                 // so the mode rides on the spec when we push.
                 if self.is_keyword("ENCRYPTED") {
                     self.advance();
-                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                    let (mode, group) = self.parse_encryption_mode_and_group(&ftype)?;
+                    spec.encryption = mode;
+                    spec.encryption_group = group;
                 }
                 base_fields.push(spec);
             } else if self.is_keyword("FIBER") {
                 self.advance();
                 if self.is_keyword("ENCRYPTED") {
                     self.advance();
-                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                    let (mode, group) = self.parse_encryption_mode_and_group(&ftype)?;
+                    spec.encryption = mode;
+                    spec.encryption_group = group;
                 }
                 fiber_fields.push(spec);
             } else if base_fields.is_empty() {
                 if self.is_keyword("ENCRYPTED") {
                     self.advance();
-                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                    let (mode, group) = self.parse_encryption_mode_and_group(&ftype)?;
+                    spec.encryption = mode;
+                    spec.encryption_group = group;
                 }
                 base_fields.push(spec);
             } else {
                 if self.is_keyword("ENCRYPTED") {
                     self.advance();
-                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                    let (mode, group) = self.parse_encryption_mode_and_group(&ftype)?;
+                    spec.encryption = mode;
+                    spec.encryption_group = group;
                 }
                 fiber_fields.push(spec);
             }
@@ -2101,6 +2206,9 @@ impl Parser {
         // INVARIANT field = value +/- tol
         let invariants = self.parse_invariant_specs();
 
+        // v0.2: WITH ENCRYPTION SEED clause may follow.
+        let seed_source = self.parse_optional_encryption_seed_clause()?;
+
         Ok(Statement::CreateBundle {
             name,
             base_fields,
@@ -2109,6 +2217,7 @@ impl Parser {
             encrypted,
             adjacencies,
             invariants,
+            seed_source,
         })
     }
 
@@ -3546,6 +3655,9 @@ pub fn spec_to_field_def(spec: &FieldSpec) -> crate::types::FieldDef {
         fd = fd.with_default(literal_to_value(d));
     }
     fd = fd.with_encryption(spec.encryption);
+    if let Some(ref g) = spec.encryption_group {
+        fd = fd.with_encryption_group(g);
+    }
     fd
 }
 
@@ -3660,6 +3772,28 @@ pub struct GqlBundleInfo {
     pub fields: usize,
 }
 
+/// Resolve an `EncryptionSeedSource` to a 32-byte master seed at bundle-creation
+/// time. v0.2 — wraps the v0.1 random path with hex / env-var alternatives.
+fn resolve_seed(
+    source: &crate::types::EncryptionSeedSource,
+) -> Result<[u8; 32], String> {
+    use crate::types::EncryptionSeedSource as S;
+    match source {
+        S::Random => Ok(crate::crypto::GaugeKey::random_seed()),
+        S::Hex(hex) => crate::crypto::seed_from_hex(hex),
+        S::Env(name) => {
+            let value = std::env::var(name).map_err(|_| {
+                format!(
+                    "WITH ENCRYPTION SEED FROM ENV {name}: env var is not set on this engine"
+                )
+            })?;
+            crate::crypto::seed_from_hex(&value).map_err(|e| {
+                format!("env var {name} did not contain a valid 64-char hex seed: {e}")
+            })
+        }
+    }
+}
+
 /// Execute a parsed statement against an Engine.
 pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<ExecResult, String> {
     match stmt {
@@ -3672,6 +3806,7 @@ pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<E
             encrypted,
             adjacencies,
             invariants,
+            seed_source,
         } => {
             let mut schema = crate::types::BundleSchema::new(name);
             for f in base_fields {
@@ -3705,14 +3840,14 @@ pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<E
                         fd.encryption = crate::types::EncryptionMode::default_for_type(&fd.field_type);
                     }
                 }
-                let seed = crate::crypto::GaugeKey::random_seed();
+                let seed = resolve_seed(seed_source)?;
                 let gk = crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
                 schema.gauge_key = Some(gk);
             } else if schema.fiber_fields.iter().any(|fd| fd.encryption.is_encrypted()) {
                 // Per-field encryption declared without bundle-level shorthand.
                 // Generate a seed and derive the GaugeKey so the engine has
                 // crypto material on hand for fields that ARE encrypted.
-                let seed = crate::crypto::GaugeKey::random_seed();
+                let seed = resolve_seed(seed_source)?;
                 let gk = crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
                 schema.gauge_key = Some(gk);
             }
@@ -6455,8 +6590,100 @@ mod tests {
         result.expect_err("negative SIGMA should be rejected");
     }
 
-    #[test]
-    fn test_parse_mixed_modes_in_one_bundle() {
+    // ── Sprint F: WITH ENCRYPTION SEED clause ──
+
+  #[test]
+  fn test_parse_with_encryption_seed_hex() {
+      let hex = "0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c";
+      let stmt = parse(&format!(
+          "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED) WITH ENCRYPTION SEED '{hex}'"
+      )).unwrap();
+      match stmt {
+          Statement::CreateBundle { seed_source, .. } => {
+              match seed_source {
+                  crate::types::EncryptionSeedSource::Hex(s) => assert_eq!(s, hex),
+                  other => panic!("expected Hex seed source, got {:?}", other),
+              }
+          }
+          _ => panic!("Expected CreateBundle"),
+      }
+  }
+
+  #[test]
+  fn test_parse_seed_hex_must_be_64_chars() {
+      let result = parse(
+          "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER) WITH ENCRYPTION SEED 'tooshort'"
+      );
+      let err = result.expect_err("64-char check should fire");
+      assert!(err.contains("64") || err.to_lowercase().contains("characters"),
+          "error should mention the 64-char rule, got: {err}");
+  }
+
+  #[test]
+  fn test_parse_seed_hex_rejects_non_hex_chars() {
+      // 64 chars but contains non-hex 'g'.
+      let bad = "g".repeat(64);
+      let result = parse(&format!(
+          "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER) WITH ENCRYPTION SEED '{bad}'"
+      ));
+      let err = result.expect_err("non-hex should be rejected");
+      assert!(err.to_lowercase().contains("hex"),
+          "error should mention hex constraint, got: {err}");
+  }
+
+  #[test]
+  fn test_parse_seed_from_env() {
+      let stmt = parse(
+          "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED) WITH ENCRYPTION SEED FROM ENV JG_GIGI_SEED"
+      ).unwrap();
+      match stmt {
+          Statement::CreateBundle { seed_source, .. } => {
+              match seed_source {
+                  crate::types::EncryptionSeedSource::Env(n) => assert_eq!(n, "JG_GIGI_SEED"),
+                  other => panic!("expected Env seed source, got {:?}", other),
+              }
+          }
+          _ => panic!("Expected CreateBundle"),
+      }
+  }
+
+  #[test]
+  fn test_parse_no_seed_clause_defaults_to_random() {
+      let stmt = parse(
+          "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED)"
+      ).unwrap();
+      match stmt {
+          Statement::CreateBundle { seed_source, .. } => {
+              assert_eq!(seed_source, crate::types::EncryptionSeedSource::Random);
+          }
+          _ => panic!("Expected CreateBundle"),
+      }
+  }
+
+  #[test]
+  fn test_parse_seed_clause_with_per_field_modes() {
+      // The realistic case: per-field modes + user-supplied hex seed.
+      let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+      let sql = format!(
+          "CREATE BUNDLE acct (\
+            email TEXT BASE, \
+            legal_name TEXT FIBER ENCRYPTED OPAQUE, \
+            kind TEXT FIBER ENCRYPTED INDEXED\
+          ) WITH ENCRYPTION SEED '{hex}'"
+      );
+      let stmt = parse(&sql).unwrap();
+      match stmt {
+          Statement::CreateBundle { seed_source, fiber_fields, .. } => {
+              assert!(matches!(seed_source, crate::types::EncryptionSeedSource::Hex(_)));
+              assert_eq!(fiber_fields[0].encryption, EncryptionMode::Opaque);
+              assert_eq!(fiber_fields[1].encryption, EncryptionMode::Indexed);
+          }
+          _ => panic!("Expected CreateBundle"),
+      }
+  }
+
+  #[test]
+  fn test_parse_mixed_modes_in_one_bundle() {
         // The realistic case: jg_account-style schema with a mix of opaque text
         // fields, indexed text fields, and a numeric field. Every per-field
         // mode is declared explicitly; bundle-level ENCRYPTED is NOT used.

@@ -609,6 +609,7 @@ fn decode_field_def(data: &[u8], offset: &mut usize) -> io::Result<FieldDef> {
         // pre-v0.2 honor the bundle-level gauge_key path independently of
         // this field, so backwards-compat is preserved.
         encryption: crate::types::EncryptionMode::None,
+        encryption_group: None,
     })
 }
 
@@ -654,6 +655,45 @@ fn encode_schema(schema: &BundleSchema) -> Vec<u8> {
                 crate::crypto::FieldTransform::Indexed { key } => {
                     buf.push(0x03);
                     buf.extend_from_slice(key);
+                }
+                crate::crypto::FieldTransform::Probabilistic {
+                    scale,
+                    offset,
+                    sigma,
+                    bucket_key,
+                } => {
+                    // Tag 0x04: [f64 scale | f64 offset | f64 sigma | 32B bucket_key]
+                    buf.push(0x04);
+                    buf.extend_from_slice(&scale.to_le_bytes());
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                    buf.extend_from_slice(&sigma.to_le_bytes());
+                    buf.extend_from_slice(bucket_key);
+                }
+                crate::crypto::FieldTransform::Isometric {
+                    group_id,
+                    matrix,
+                    offset_vec,
+                    member_index,
+                } => {
+                    // Tag 0x05:
+                    //   [u32 member_index]
+                    //   [u32 group_id_len][group_id_bytes]
+                    //   [u32 k][k*k * f64 matrix row-major][k * f64 offset]
+                    buf.push(0x05);
+                    buf.extend_from_slice(&(*member_index as u32).to_le_bytes());
+                    let gid_bytes = group_id.as_bytes();
+                    buf.extend_from_slice(&(gid_bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(gid_bytes);
+                    let k = matrix.len();
+                    buf.extend_from_slice(&(k as u32).to_le_bytes());
+                    for row in matrix {
+                        for v in row {
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    for v in offset_vec {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
                 }
             }
         }
@@ -752,6 +792,55 @@ fn decode_schema(data: &[u8]) -> io::Result<BundleSchema> {
                         key.copy_from_slice(&data[offset..offset + 32]);
                         offset += 32;
                         transforms.push(crate::crypto::FieldTransform::Indexed { key });
+                    }
+                    0x04 => {
+                        // Probabilistic: scale + offset + sigma + bucket_key
+                        let scale = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                        offset += 8;
+                        let off_val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                        offset += 8;
+                        let sigma = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                        offset += 8;
+                        let mut bucket_key = [0u8; 32];
+                        bucket_key.copy_from_slice(&data[offset..offset + 32]);
+                        offset += 32;
+                        transforms.push(crate::crypto::FieldTransform::Probabilistic {
+                            scale,
+                            offset: off_val,
+                            sigma,
+                            bucket_key,
+                        });
+                    }
+                    0x05 => {
+                        // Isometric: member_index + group_id + matrix + offset_vec
+                        let member_index = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        offset += 4;
+                        let gid_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        offset += 4;
+                        let group_id = String::from_utf8_lossy(&data[offset..offset + gid_len]).into_owned();
+                        offset += gid_len;
+                        let k = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        offset += 4;
+                        let mut matrix = Vec::with_capacity(k);
+                        for _ in 0..k {
+                            let mut row = Vec::with_capacity(k);
+                            for _ in 0..k {
+                                row.push(f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()));
+                                offset += 8;
+                            }
+                            matrix.push(row);
+                        }
+                        let mut offset_vec = Vec::with_capacity(k);
+                        for _ in 0..k {
+                            offset_vec.push(f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()));
+                            offset += 8;
+                        }
+                        transforms.push(crate::crypto::FieldTransform::Isometric {
+                            group_id,
+                            matrix,
+                            offset_vec,
+                            member_index,
+                        });
                     }
                     other => {
                         return Err(io::Error::new(

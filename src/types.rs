@@ -219,6 +219,30 @@ impl EncryptionMode {
     }
 }
 
+/// Where the master seed used to derive a bundle's GaugeKey came from.
+/// v0.2 adds three sources beyond the v0.1 random default:
+///
+/// - `Random`  — server-generated 32-byte seed via OS CSPRNG (the v0.1 path).
+///               Used when no `WITH ENCRYPTION SEED` clause appears.
+/// - `Hex(s)`  — caller supplied 64 hex chars verbatim. Deterministic across
+///               deployments using the same seed; useful for reproducible
+///               builds and shared-key scenarios.
+/// - `Env(n)`  — schema stores the env-var name; engine resolves the actual
+///               seed at startup. Lets ops keep keys out of schema dumps and
+///               rotate via env-var change + restart.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncryptionSeedSource {
+    Random,
+    Hex(String),
+    Env(String),
+}
+
+impl Default for EncryptionSeedSource {
+    fn default() -> Self {
+        EncryptionSeedSource::Random
+    }
+}
+
 /// Field definition in the schema.
 #[derive(Debug, Clone)]
 pub struct FieldDef {
@@ -234,6 +258,13 @@ pub struct FieldDef {
     /// bundle-level `ENCRYPTED` keyword (v0.1) propagates through to per-field
     /// `default_for_type` defaults at parse time.
     pub encryption: EncryptionMode,
+    /// Optional group identifier for ISOMETRIC mode. Multiple fiber fields
+    /// declared with the same `encryption_group` share a single O(k)
+    /// orthogonal matrix at encrypt time, where k is the group size. For
+    /// non-Isometric modes this field is ignored. Defaults to `None`; a
+    /// solo Isometric field with no group declaration ends up in a
+    /// singleton group (k=1) which is the trivial sign-flip case.
+    pub encryption_group: Option<String>,
 }
 
 impl FieldDef {
@@ -245,6 +276,7 @@ impl FieldDef {
             range: None,
             weight: 1.0,
             encryption: EncryptionMode::None,
+            encryption_group: None,
         }
     }
 
@@ -256,6 +288,7 @@ impl FieldDef {
             range: None,
             weight: 1.0,
             encryption: EncryptionMode::None,
+            encryption_group: None,
         }
     }
 
@@ -267,6 +300,7 @@ impl FieldDef {
             range: Some(time_scale),
             weight: 1.0,
             encryption: EncryptionMode::None,
+            encryption_group: None,
         }
     }
 
@@ -278,6 +312,7 @@ impl FieldDef {
             range: None,
             weight: 1.0,
             encryption: EncryptionMode::None,
+            encryption_group: None,
         }
     }
 
@@ -300,6 +335,14 @@ impl FieldDef {
     /// (plaintext) until the parser sets a specific mode at schema time.
     pub fn with_encryption(mut self, mode: EncryptionMode) -> Self {
         self.encryption = mode;
+        self
+    }
+
+    /// v0.2 (Sprint E): assign this field to a named ISOMETRIC group. All fields
+    /// sharing a group_id are encrypted jointly with one shared O(k) matrix.
+    /// Group has no effect on non-Isometric modes.
+    pub fn with_encryption_group(mut self, group: impl Into<String>) -> Self {
+        self.encryption_group = Some(group.into());
         self
     }
 }

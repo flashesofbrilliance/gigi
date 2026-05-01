@@ -210,6 +210,7 @@ async fn create_bundle(
             range: None,
             weight: 1.0,
             encryption: gigi::types::EncryptionMode::None,
+            encryption_group: None,
         };
         if req.schema.keys.contains(field_name) {
             schema = schema.base(fd);

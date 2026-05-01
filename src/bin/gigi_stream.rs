@@ -1180,6 +1180,7 @@ async fn create_bundle(
             range: None,
             weight: 1.0,
             encryption: gigi::types::EncryptionMode::None,
+            encryption_group: None,
         };
         if req.schema.keys.contains(field_name) {
             schema = schema.base(fd);
@@ -3265,6 +3266,7 @@ async fn add_field(
         range: None,
         weight: 1.0,
         encryption: gigi::types::EncryptionMode::None,
+            encryption_group: None,
     };
 
     let mut engine = state.engine.write().unwrap();
@@ -5003,6 +5005,7 @@ async fn gql_query(
             encrypted,
             adjacencies,
             invariants,
+            seed_source,
         } => {
             let mut schema = gigi::types::BundleSchema::new(name);
             for f in base_fields {
@@ -5024,8 +5027,54 @@ async fn gql_query(
                     tol: inv.tol,
                 });
             }
-            if *encrypted {
-                let seed = gigi::crypto::GaugeKey::random_seed();
+            // v0.2 (Sprint F): seed_source determines whether the master seed
+            // is freshly generated, taken from a hex literal, or pulled from an
+            // environment variable. The bundle is encrypted when either the
+            // legacy `ENCRYPTED` shorthand was set OR any individual field
+            // declared an explicit non-`None` encryption mode (per-field path).
+            let any_field_encrypted = schema
+                .fiber_fields
+                .iter()
+                .any(|f| f.encryption != gigi::types::EncryptionMode::None);
+            if *encrypted || any_field_encrypted {
+                let seed = match seed_source {
+                    gigi::types::EncryptionSeedSource::Random => {
+                        gigi::crypto::GaugeKey::random_seed()
+                    }
+                    gigi::types::EncryptionSeedSource::Hex(hex) => {
+                        match gigi::crypto::seed_from_hex(hex) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                emit_quick("CREATE_BUNDLE", t0.elapsed().as_micros() as u64, true);
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({"error": format!("invalid encryption seed: {e}")})),
+                                );
+                            }
+                        }
+                    }
+                    gigi::types::EncryptionSeedSource::Env(name) => {
+                        match std::env::var(name) {
+                            Ok(hex) => match gigi::crypto::seed_from_hex(&hex) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    emit_quick("CREATE_BUNDLE", t0.elapsed().as_micros() as u64, true);
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        Json(serde_json::json!({"error": format!("invalid encryption seed in env {name}: {e}")})),
+                                    );
+                                }
+                            },
+                            Err(_) => {
+                                emit_quick("CREATE_BUNDLE", t0.elapsed().as_micros() as u64, true);
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({"error": format!("env var {name} not set")})),
+                                );
+                            }
+                        }
+                    }
+                };
                 let gk = gigi::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
                 schema.gauge_key = Some(gk);
             }
@@ -6354,6 +6403,126 @@ fn init_system_bundles(engine: &mut Engine) {
     }
 }
 
+/// Bootstrap APP-LEVEL bundles required by the consuming application
+/// (davisgeometric.com / Just Gigi). Idempotent: only creates bundles that
+/// don't already exist. Driven by the `GIGI_APP_BUNDLES` env var which
+/// holds a JSON array of bundle specs:
+///
+/// ```json
+/// [
+///   {
+///     "name": "jg_kv",
+///     "base": [{"name": "key", "type": "text"}],
+///     "fiber": [
+///       {"name": "kind", "type": "text", "indexed": true},
+///       {"name": "payload", "type": "text"},
+///       {"name": "expires_at", "type": "timestamp", "indexed": true},
+///       {"name": "updated_at", "type": "timestamp", "indexed": true}
+///     ]
+///   }
+/// ]
+/// ```
+///
+/// Without the env var, this is a no-op (system bundles still bootstrap).
+/// The check uses `engine.bundle_names()` against the live engine — never
+/// POSTs `/v1/bundles` — so it's safe across cold starts and won't wipe
+/// any existing data.
+///
+/// Why this lives in gigi-stream: the consuming application (the Vercel
+/// Next.js site) cannot safely create bundles at runtime — POSTing to
+/// `/v1/bundles` from a request handler is destructive on this version
+/// and violates the website's runtime contract. So when a Fly machine
+/// loses its `gigi_data` volume on redeploy and Tigris pull is incomplete,
+/// the database itself heals on startup.
+fn init_app_bundles(engine: &mut Engine) {
+    let manifest_raw = match std::env::var("GIGI_APP_BUNDLES") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return,
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&manifest_raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[app-bundles] GIGI_APP_BUNDLES is not valid JSON: {e}");
+            return;
+        }
+    };
+    let entries = match parsed.as_array() {
+        Some(a) => a,
+        None => {
+            eprintln!("[app-bundles] GIGI_APP_BUNDLES must be a JSON array");
+            return;
+        }
+    };
+
+    let existing: std::collections::HashSet<String> =
+        engine.bundle_names().iter().map(|s| s.to_string()).collect();
+
+    for entry in entries {
+        let name = match entry.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => {
+                eprintln!("[app-bundles] entry missing `name`: {entry}");
+                continue;
+            }
+        };
+        if existing.contains(name) {
+            continue; // already there — never recreate, never wipe
+        }
+
+        // Build the schema fresh. BundleSchema's base/fiber/index consume self
+        // and return Self, so we accumulate by reassigning.
+        let mut schema = BundleSchema::new(name);
+        let mut indexed_fields: Vec<String> = Vec::new();
+        let mut bad_entry = false;
+
+        for (section_key, is_base) in [("base", true), ("fiber", false)] {
+            if bad_entry { break; }
+            let arr = match entry.get(section_key).and_then(|v| v.as_array()) {
+                Some(a) => a,
+                None => continue,
+            };
+            for f in arr {
+                let fname = match f.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => n.to_string(),
+                    None => {
+                        eprintln!("[app-bundles] {name}: field missing `name`");
+                        bad_entry = true;
+                        break;
+                    }
+                };
+                let ftype = f.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+                let def = match ftype.to_ascii_lowercase().as_str() {
+                    "text" | "string" | "categorical" => FieldDef::categorical(&fname),
+                    "numeric" | "int" | "integer" | "float" | "double" | "timestamp" => {
+                        FieldDef::numeric(&fname)
+                    }
+                    other => {
+                        eprintln!(
+                            "[app-bundles] {name}.{fname}: unknown type `{other}`, defaulting to text"
+                        );
+                        FieldDef::categorical(&fname)
+                    }
+                };
+                schema = if is_base { schema.base(def) } else { schema.fiber(def) };
+                if f.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    indexed_fields.push(fname);
+                }
+            }
+        }
+        if bad_entry { continue; }
+
+        for f in indexed_fields {
+            schema = schema.index(&f);
+        }
+
+        match engine.create_bundle(schema) {
+            Ok(_) => eprintln!("[app-bundles] created missing bundle: {name}"),
+            Err(e) => eprintln!("[app-bundles] failed to create {name}: {e}"),
+        }
+    }
+}
+
 /// Helper: convert a serde_json::Value payload field into a GIGI Value.
 fn log_json_to_value(v: &serde_json::Value) -> Value {
     match v {
@@ -6774,6 +6943,7 @@ async fn main() {
                         let mut eng = replay_state.engine.write().unwrap();
                         *eng = mmap_engine;
                         init_system_bundles(&mut eng);
+                        init_app_bundles(&mut eng);
                     }
                     #[cfg(unix)]
                     unsafe { libc::malloc_trim(0); }
@@ -6821,6 +6991,7 @@ async fn main() {
                     eprintln!("Post-replay snapshot failed: {e}");
                     // Non-fatal: we keep running on heap. Mmap upgrade skipped.
                     init_system_bundles(&mut engine);
+                    init_app_bundles(&mut engine);
                     drop(engine);
                     replay_state.ready.store(true, Ordering::Release);
                     eprintln!("Engine ready — running on heap (snapshot failed)");
@@ -6837,6 +7008,7 @@ async fn main() {
                 let mut engine = replay_state.engine.write().unwrap();
                 *engine = mmap_engine;
                 init_system_bundles(&mut engine);
+                init_app_bundles(&mut engine);
                 drop(engine);
 
                 // Force glibc to return freed heap pages to the OS.
@@ -6849,7 +7021,9 @@ async fn main() {
             Err(e) => {
                 eprintln!("Mmap reopen failed: {e} — keeping heap engine");
                 // init on the existing heap engine (which has replay data)
-                init_system_bundles(&mut replay_state.engine.write().unwrap());
+                let mut eng = replay_state.engine.write().unwrap();
+                init_system_bundles(&mut eng);
+                init_app_bundles(&mut eng);
             }
         }
 
@@ -7943,4 +8117,229 @@ mod tests {
         }
     }
 
+    // ── Sprint G: app-bundle bootstrap regression tests ────────────────────
+    //
+    // These tests cover the failure mode that wiped Just Gigi customer chat
+    // on 2026-05-01: gigi-stream redeployed without the `jg_kv` bundle, the
+    // website returned 500 from /admin/chat, and conversations were lost.
+    //
+    // The contract `init_app_bundles` must satisfy is:
+    //   1. NEVER touch an existing bundle (regardless of whether it appears
+    //      in the manifest).  This is the data-safety invariant.
+    //   2. Create missing bundles from the manifest schema.
+    //   3. Be a no-op when the env var is unset, empty, or invalid — never
+    //      panic, never abort startup.
+
+    // Env vars are global state. Tests run in parallel by default, so we
+    // serialize the tests that touch GIGI_APP_BUNDLES.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII guard: sets GIGI_APP_BUNDLES on construction, removes on drop.
+    /// Holds the env lock for its lifetime so concurrent tests don't race.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            // SAFETY: serialized via env_lock() so no concurrent reads
+            // from other env-touching tests during the set/get window.
+            unsafe { std::env::set_var("GIGI_APP_BUNDLES", value); }
+            Self { _lock: lock }
+        }
+        fn unset() -> Self {
+            let lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var("GIGI_APP_BUNDLES"); }
+            Self { _lock: lock }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("GIGI_APP_BUNDLES"); }
+        }
+    }
+
+    /// Test 1: when the manifest names a missing bundle, it gets created
+    /// with the right schema. This is the recovery path.
+    #[test]
+    fn init_app_bundles_creates_missing_bundle() {
+        let dir = tmp_dir("init_app_bundles_create");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        let manifest = r#"[{
+            "name": "jg_kv",
+            "base":  [{"name": "key", "type": "text"}],
+            "fiber": [
+                {"name": "kind", "type": "text", "indexed": true},
+                {"name": "payload", "type": "text"},
+                {"name": "expires_at", "type": "timestamp", "indexed": true},
+                {"name": "updated_at", "type": "timestamp", "indexed": true}
+            ]
+        }]"#;
+        let _g = EnvGuard::set(manifest);
+
+        assert!(!engine.bundle_names().contains(&"jg_kv"));
+        init_app_bundles(&mut engine);
+        assert!(
+            engine.bundle_names().contains(&"jg_kv"),
+            "bundle must be created from manifest"
+        );
+
+        let store = engine.bundle("jg_kv").expect("bundle present");
+        let schema = store.schema();
+        assert_eq!(schema.base_fields.len(), 1, "1 base field");
+        assert_eq!(schema.base_fields[0].name, "key");
+        let fiber_names: Vec<String> = schema.fiber_fields.iter().map(|f| f.name.clone()).collect();
+        assert!(fiber_names.contains(&"kind".into()));
+        assert!(fiber_names.contains(&"payload".into()));
+        assert!(fiber_names.contains(&"expires_at".into()));
+        assert!(fiber_names.contains(&"updated_at".into()));
+
+        cleanup(&dir);
+    }
+
+    /// **CRITICAL DATA-SAFETY TEST.** When the manifest names a bundle that
+    /// already exists *with data*, init_app_bundles must NOT recreate or
+    /// otherwise touch it. If this test ever fails, the bootstrap path has
+    /// regressed into the very wipe-on-cold-start behavior that motivated
+    /// this whole sprint.
+    #[test]
+    fn init_app_bundles_never_wipes_existing_bundle_with_data() {
+        let dir = tmp_dir("init_app_bundles_no_wipe");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        // Pre-create the bundle the manifest will reference, with a
+        // *different* schema than the manifest specifies — so if
+        // init_app_bundles incorrectly recreates it, we'll see the schema
+        // change as well as record loss.
+        let pre_schema = BundleSchema::new("jg_kv")
+            .base(FieldDef::categorical("key"))
+            .fiber(FieldDef::categorical("payload_v1"))   // intentionally
+            .fiber(FieldDef::categorical("legacy_field")); // different
+        engine.create_bundle(pre_schema).unwrap();
+
+        // Insert data we want to preserve. These are real chat-like records.
+        let mut r1 = Record::new();
+        r1.insert("key".into(), Value::Text("jg:conv:abc".into()));
+        r1.insert("payload_v1".into(), Value::Text("{\"id\":\"abc\",\"messages\":3}".into()));
+        r1.insert("legacy_field".into(), Value::Text("v1".into()));
+        engine.insert("jg_kv", &r1).unwrap();
+
+        let mut r2 = Record::new();
+        r2.insert("key".into(), Value::Text("jg:conv_index".into()));
+        r2.insert("payload_v1".into(), Value::Text("[\"abc\",\"def\"]".into()));
+        r2.insert("legacy_field".into(), Value::Text("v1".into()));
+        engine.insert("jg_kv", &r2).unwrap();
+
+        let records_before = engine.bundle("jg_kv").unwrap().len();
+        assert_eq!(records_before, 2, "precondition: 2 records inserted");
+
+        // Manifest names jg_kv with a DIFFERENT schema. init_app_bundles
+        // must see "already exists" and skip — preserving the original
+        // schema and all 2 records.
+        let manifest = r#"[{
+            "name": "jg_kv",
+            "base":  [{"name": "key", "type": "text"}],
+            "fiber": [
+                {"name": "payload_v2", "type": "text"},
+                {"name": "kind", "type": "text", "indexed": true}
+            ]
+        }]"#;
+        let _g = EnvGuard::set(manifest);
+
+        init_app_bundles(&mut engine);
+
+        // Bundle still exists.
+        assert!(engine.bundle_names().contains(&"jg_kv"));
+
+        // Schema is the ORIGINAL one — manifest schema must not have been
+        // applied. This is the clearest signal that the bundle wasn't
+        // recreated.
+        let store = engine.bundle("jg_kv").unwrap();
+        let fiber_names: std::collections::HashSet<String> =
+            store.schema().fiber_fields.iter().map(|f| f.name.clone()).collect();
+        assert!(
+            fiber_names.contains("payload_v1"),
+            "original schema field `payload_v1` must still be present; \
+             got fiber fields {fiber_names:?} — init_app_bundles RECREATED \
+             an existing bundle, which is the data-loss bug"
+        );
+        assert!(
+            !fiber_names.contains("payload_v2"),
+            "manifest field `payload_v2` must NOT have been applied to \
+             existing bundle"
+        );
+
+        // Records survive.
+        let records_after = store.len();
+        assert_eq!(
+            records_after, records_before,
+            "records must not be lost — got {records_after}, expected {records_before}"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// Test 3: no env var → no-op. Doesn't create anything, doesn't panic.
+    #[test]
+    fn init_app_bundles_no_env_is_noop() {
+        let dir = tmp_dir("init_app_bundles_no_env");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        let _g = EnvGuard::unset();
+
+        let names_before: Vec<String> = engine.bundle_names().iter().map(|s| s.to_string()).collect();
+        init_app_bundles(&mut engine);
+        let names_after: Vec<String> = engine.bundle_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(names_before, names_after, "no env var → no changes");
+
+        cleanup(&dir);
+    }
+
+    /// Test 4: invalid JSON → graceful no-op (logged to stderr, no panic).
+    /// Startup must continue even when the operator misconfigures the manifest.
+    #[test]
+    fn init_app_bundles_invalid_json_is_safe() {
+        let dir = tmp_dir("init_app_bundles_bad_json");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        let _g = EnvGuard::set("not valid json {[}");
+
+        let names_before: Vec<String> = engine.bundle_names().iter().map(|s| s.to_string()).collect();
+        init_app_bundles(&mut engine); // must not panic
+        let names_after: Vec<String> = engine.bundle_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(names_before, names_after);
+
+        cleanup(&dir);
+    }
+
+    /// Test 5: a manifest entry with an unknown bundle name AND a missing
+    /// `name` field must be skipped without aborting the rest of the manifest.
+    /// (Defense in depth: one bad entry shouldn't take out the whole boot.)
+    #[test]
+    fn init_app_bundles_skips_malformed_entries() {
+        let dir = tmp_dir("init_app_bundles_malformed");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        let manifest = r#"[
+            {"base": [{"name":"x","type":"text"}]},
+            {"name": "good_bundle", "fiber": [{"name":"y","type":"text"}]}
+        ]"#;
+        let _g = EnvGuard::set(manifest);
+
+        init_app_bundles(&mut engine);
+        // The malformed entry is skipped; the good one is created.
+        assert!(engine.bundle_names().contains(&"good_bundle"));
+
+        cleanup(&dir);
+    }
 }

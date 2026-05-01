@@ -14,6 +14,12 @@ primary_region = "iad"
   # AWS_ENDPOINT_URL_S3, AWS_REGION, and BUCKET_NAME are already set as Fly secrets
   # by `flyctl storage create`. TIGRIS_BUCKET_NAME here matches Fly's BUCKET_NAME secret.
   TIGRIS_BUCKET_NAME = "gigi-snapshots"
+  # App-bundle bootstrap manifest. On every startup, after WAL replay +
+  # Tigris pull + system bundles, gigi-stream checks each entry: if the
+  # bundle is missing, it creates it from this schema. Idempotent — never
+  # touches an existing bundle. Add an entry here for any app-required
+  # bundle that must survive a Fly volume loss / cross-machine reschedule.
+  GIGI_APP_BUNDLES = '''[{"name":"jg_kv","base":[{"name":"key","type":"text"}],"fiber":[{"name":"kind","type":"text","indexed":true},{"name":"payload","type":"text"},{"name":"expires_at","type":"timestamp","indexed":true},{"name":"updated_at","type":"timestamp","indexed":true}]}]'''
 
 [http_service]
   internal_port = 3142

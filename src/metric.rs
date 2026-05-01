@@ -374,6 +374,7 @@ pub fn kl_divergence_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EncryptionMode;
 
     /// TDD-1.12: Fisher metric numeric — g_F matches normalized L2.
     #[test]
@@ -443,7 +444,8 @@ mod tests {
             default: Value::Null,
             range: None,
             weight: 1.0,
-            encryption: crate::types::EncryptionMode::None,
+            encryption: EncryptionMode::None,
+            encryption_group: None,
         };
         let d_full = FiberMetric::component_distance(
             &f,

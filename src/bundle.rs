@@ -5774,7 +5774,7 @@ mod tests {
     // ── vector_search tests ─────────────────────────────────────────────────
 
     fn make_vector_store() -> BundleStore {
-        use crate::types::FieldType;
+        use crate::types::{EncryptionMode, FieldType};
         let schema = BundleSchema::new("vecs")
             .base(FieldDef {
                 name: "id".into(),
@@ -5782,7 +5782,8 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
-                encryption: crate::types::EncryptionMode::None,
+                encryption: EncryptionMode::None,
+            encryption_group: None,
             })
             .fiber(FieldDef {
                 name: "emb".into(),
@@ -5790,7 +5791,8 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
-                encryption: crate::types::EncryptionMode::None,
+                encryption: EncryptionMode::None,
+            encryption_group: None,
             })
             .fiber(FieldDef {
                 name: "cat".into(),
@@ -5798,7 +5800,8 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
-                encryption: crate::types::EncryptionMode::None,
+                encryption: EncryptionMode::None,
+            encryption_group: None,
             });
         let mut store = BundleStore::new(schema);
         // Insert 5 vectors at known positions in 2D

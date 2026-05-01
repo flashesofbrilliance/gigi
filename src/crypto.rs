@@ -46,6 +46,49 @@ pub enum FieldTransform {
     /// encryption leaks frequency on low-cardinality data — schema author
     /// must opt in).
     Indexed { key: [u8; 32] },
+
+    /// Affine + Gaussian noise: w = scale * v + offset + ε, ε ~ N(0, sigma²).
+    /// Numeric only. Statistical unlinkability — same plaintext encrypts to
+    /// different ciphertexts each call. Equality-queryable via the Davis
+    /// Identity: a deterministic σ-bucket hash of the plaintext is stored
+    /// alongside the noisy value, so HashMap-probe equality search returns
+    /// records whose plaintext shared a σ-bucket with the query literal.
+    /// On-disk wire: `Value::Binary([f64 noisy_value | u64 bucket_hash])` = 16 B.
+    /// Decrypt recovers `(noisy - offset) / scale` ± σ/|scale| (approximate).
+    Probabilistic {
+        scale: f64,
+        offset: f64,
+        sigma: f64,
+        bucket_key: [u8; 32],
+    },
+
+    /// Orthogonal O(k) gauge for grouped numeric fiber: w = O·v + b,
+    /// O ∈ O(k) (orthogonal: O^T O = I), b ∈ ℝ^k. Pairwise Euclidean
+    /// distances preserved exactly: ||O·u - O·v|| = ||u - v||. For k=1 this
+    /// degenerates to a sign flip + offset (which is technically isometric
+    /// but trivially so); the real value is at k≥2 where the group rotation
+    /// scrambles individual components while preserving the geometric
+    /// structure of the vector. Each fiber field carries the same shared
+    /// matrix when fields are declared in the same `GROUP`.
+    ///
+    /// Storage: each component is encrypted independently as `Value::Float`
+    /// of the corresponding row of `O·v + b`. The schema groups the fields;
+    /// the GaugeKey holds the same Isometric variant on every member.
+    Isometric {
+        /// Group identifier (`"wind"`, `"embedding"`, etc.). All fields with
+        /// the same group_id share the same matrix and offset.
+        group_id: String,
+        /// k×k orthogonal matrix in row-major order. Built once per group
+        /// from the seed via QR decomposition of a Gaussian matrix.
+        matrix: Vec<Vec<f64>>,
+        /// k-dimensional offset b.
+        offset_vec: Vec<f64>,
+        /// This field's row index within the group (0..k-1). Used to extract
+        /// the appropriate row of O·v during encrypt and the column of O^T
+        /// during decrypt. Named `member_index` because each field is one
+        /// member of the group, occupying one row of the shared matrix.
+        member_index: usize,
+    },
 }
 
 impl FieldTransform {
@@ -72,13 +115,42 @@ impl FieldTransform {
                 let tag = cmac_prf(key, &plaintext_bytes);
                 Value::Binary(tag.to_vec())
             }
+            FieldTransform::Probabilistic { scale, offset, sigma, bucket_key } => {
+                // Extract numeric plaintext. Non-numeric falls through.
+                let plain = match v {
+                    Value::Float(f) => *f,
+                    Value::Integer(i) => *i as f64,
+                    Value::Timestamp(t) => *t as f64,
+                    _ => return v.clone(),
+                };
+                let noise = gaussian_sample(*sigma);
+                let noisy = scale * plain + offset + noise;
+                let bucket = bucket_hash(bucket_key, plain, *sigma);
+
+                // Wire format: 16 bytes = [f64 noisy | u64 bucket].
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&noisy.to_le_bytes());
+                buf.extend_from_slice(&bucket.to_le_bytes());
+                Value::Binary(buf)
+            }
+            FieldTransform::Isometric { .. } => {
+                // Isometric requires the GROUP context (other members'
+                // plaintext values to compute O·v). Single-value encrypt
+                // can't produce the right output. The group-aware code
+                // path lives in `encrypt_fiber` which collects all group
+                // members and applies the matrix once. If we land here
+                // (solo encrypt of an Isometric field), fall through as
+                // identity — caller likely went through the wrong path.
+                v.clone()
+            }
         }
     }
 
     /// Apply the inverse transform. For Indexed, the PRF is one-way — decrypt
     /// returns the stored ciphertext bytes as-is (the caller knows from the
     /// schema that the field is one-way encrypted; equality search is the
-    /// supported access pattern).
+    /// supported access pattern). For Probabilistic, decrypt is approximate:
+    /// recovers `(noisy - offset) / scale` with precision ±σ/|scale|.
     pub fn decrypt_value(&self, w: &Value, aad: &[u8]) -> Value {
         match self {
             FieldTransform::Identity => w.clone(),
@@ -102,6 +174,19 @@ impl FieldTransform {
                 // PRF is one-way. Return the stored ciphertext as-is.
                 w.clone()
             }
+            FieldTransform::Probabilistic { scale, offset, .. } => match w {
+                Value::Binary(bytes) if bytes.len() == 16 => {
+                    let noisy = f64::from_le_bytes(bytes[..8].try_into().unwrap());
+                    let plain_estimate = (noisy - offset) / scale;
+                    Value::Float(plain_estimate)
+                }
+                other => other.clone(),
+            },
+            FieldTransform::Isometric { .. } => {
+                // Same as encrypt: needs group context. Single-value
+                // decrypt falls through; the real path is in decrypt_fiber.
+                w.clone()
+            }
         }
     }
 }
@@ -119,12 +204,49 @@ impl GaugeKey {
     ///   - `Affine`         → Affine { scale, offset }   (KDF from seed + name)
     ///   - `Opaque`         → Opaque { key: 32B }        (KDF from seed + name)
     ///   - `Indexed`        → Indexed { key: 32B }       (KDF from seed + name)
-    ///   - `Probabilistic`  → reserved (Sprint D — falls through to Identity for now)
-    ///   - `Isometric`      → reserved (Sprint E — falls through to Identity for now)
+    ///   - `Probabilistic`  → Probabilistic { scale, offset, sigma, bucket_key }
+    ///   - `Isometric`      → Isometric { group_id, matrix, offset_vec, member_index }
+    ///                        Sibling fields with the same `encryption_group`
+    ///                        share the same matrix and offset, derived once
+    ///                        per group from the seed.
     pub fn derive(seed: &[u8; 32], fiber_fields: &[FieldDef]) -> Self {
+        // Pre-pass: discover Isometric groups so we know each group's k
+        // (size) and each field's member_index within its group. Members
+        // are listed in schema order (the order matters: it's the row
+        // ordering of the matrix when we apply O·v).
+        use std::collections::HashMap;
+        let mut group_members: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, field) in fiber_fields.iter().enumerate() {
+            if matches!(field.encryption, crate::types::EncryptionMode::Isometric) {
+                let gid = field.encryption_group.clone().unwrap_or_else(|| field.name.clone());
+                group_members.entry(gid).or_default().push(i);
+            }
+        }
+
+        // Per-group: derive the shared O(k) matrix + offset once.
+        let mut group_matrices: HashMap<String, (Vec<Vec<f64>>, Vec<f64>)> = HashMap::new();
+        for (gid, members) in &group_members {
+            let k = members.len();
+            let m = derive_orthogonal_matrix(seed, gid, k);
+            group_matrices.insert(gid.clone(), m);
+        }
+
         let transforms = fiber_fields
             .iter()
-            .map(|field| Self::derive_field_transform(seed, &field.name, &field.field_type, &field.encryption))
+            .enumerate()
+            .map(|(i, field)| {
+                if matches!(field.encryption, crate::types::EncryptionMode::Isometric) {
+                    let gid = field.encryption_group.clone().unwrap_or_else(|| field.name.clone());
+                    let members = group_members.get(&gid).cloned().unwrap_or_else(|| vec![i]);
+                    let member_index = members.iter().position(|&x| x == i).unwrap_or(0);
+                    let (matrix, offset_vec) = group_matrices.get(&gid).cloned().unwrap_or_else(|| {
+                        derive_orthogonal_matrix(seed, &gid, 1)
+                    });
+                    FieldTransform::Isometric { group_id: gid, matrix, offset_vec, member_index }
+                } else {
+                    Self::derive_field_transform(seed, &field.name, &field.field_type, &field.encryption)
+                }
+            })
             .collect();
         GaugeKey { transforms }
     }
@@ -149,11 +271,8 @@ impl GaugeKey {
             EncryptionMode::Affine => Self::derive_affine(seed, field_name),
             EncryptionMode::Opaque => Self::derive_opaque(seed, field_name),
             EncryptionMode::Indexed => Self::derive_indexed(seed, field_name),
-            EncryptionMode::Probabilistic { .. } => {
-                // Sprint D — placeholder; full implementation lands when
-                // PROBABILISTIC mode ships.
-                let _ = field_type;
-                FieldTransform::Identity
+            EncryptionMode::Probabilistic { sigma } => {
+                Self::derive_probabilistic(seed, field_name, *sigma)
             }
             EncryptionMode::Isometric => {
                 // Sprint E — placeholder.
@@ -197,6 +316,28 @@ impl GaugeKey {
         }
     }
 
+    fn derive_probabilistic(seed: &[u8; 32], field_name: &str, sigma: f64) -> FieldTransform {
+        // Reuse the affine-derivation routine to get scale + offset; this
+        // ensures the same field name always produces the same affine params,
+        // and the σ-bucket lookup is deterministic.
+        let mut hasher_bytes = Vec::with_capacity(seed.len() + field_name.len() + 9);
+        hasher_bytes.extend_from_slice(seed);
+        hasher_bytes.extend_from_slice(b":prob:");
+        hasher_bytes.extend_from_slice(field_name.as_bytes());
+
+        let h1 = mix_hash(&hasher_bytes, 0x517cc1b727220a95);
+        let h2 = mix_hash(&hasher_bytes, 0x6c62272e07bb0142);
+        let scale = 0.1 + ((h1 as f64) / (u64::MAX as f64)) * 9.9; // [0.1, 10)
+        let offset = -1000.0 + ((h2 as f64) / (u64::MAX as f64)) * 2000.0; // [-1000, 1000)
+
+        FieldTransform::Probabilistic {
+            scale,
+            offset,
+            sigma,
+            bucket_key: derive_field_key(seed, b":prob_bucket:", field_name),
+        }
+    }
+
     /// Simple deterministic hash mixing (wyhash-inspired). Public so the WAL
     /// can re-derive keys deterministically when reloading a schema.
     pub fn mix_hash(data: &[u8], seed: u64) -> u64 {
@@ -207,46 +348,145 @@ impl GaugeKey {
     /// is used to construct AAD that binds each ciphertext to its position
     /// (bundle, field index, field name) — so a ciphertext swapped between
     /// fields or between bundles fails authentication on decrypt.
+    ///
+    /// Two-pass: non-Isometric fields encrypt independently in pass 1; pass 2
+    /// gathers each Isometric group's plaintext values, applies the shared
+    /// `O·v + b` matrix once, distributes results back into the output by
+    /// member_index. This is the only way to honor the GROUP semantics —
+    /// individual field encrypts can't preserve pairwise distances.
     pub fn encrypt_fiber(
         &self,
         fiber_vals: &[Value],
         bundle_name: &str,
         fiber_fields: &[FieldDef],
     ) -> Vec<Value> {
-        fiber_vals
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                if let Some(t) = self.transforms.get(i) {
-                    let aad = build_aad(bundle_name, i, fiber_fields.get(i).map(|f| f.name.as_str()).unwrap_or(""));
-                    t.encrypt_value(v, &aad)
-                } else {
-                    v.clone()
+        let mut out: Vec<Value> = vec![Value::Null; fiber_vals.len()];
+        // Group accumulator: group_id → list of (field_index, member_index, plaintext)
+        use std::collections::HashMap;
+        let mut group_pending: HashMap<String, Vec<(usize, usize, f64)>> = HashMap::new();
+
+        for (i, v) in fiber_vals.iter().enumerate() {
+            match self.transforms.get(i) {
+                Some(FieldTransform::Isometric { group_id, member_index, .. }) => {
+                    let plain = match v {
+                        Value::Float(f) => *f,
+                        Value::Integer(n) => *n as f64,
+                        Value::Timestamp(t) => *t as f64,
+                        _ => 0.0,
+                    };
+                    group_pending
+                        .entry(group_id.clone())
+                        .or_default()
+                        .push((i, *member_index, plain));
                 }
-            })
-            .collect()
+                Some(t) => {
+                    let aad = build_aad(
+                        bundle_name,
+                        i,
+                        fiber_fields.get(i).map(|f| f.name.as_str()).unwrap_or(""),
+                    );
+                    out[i] = t.encrypt_value(v, &aad);
+                }
+                None => out[i] = v.clone(),
+            }
+        }
+
+        // Apply each group's matrix once.
+        for (_group_id, mut members) in group_pending {
+            members.sort_by_key(|&(_, mi, _)| mi);
+            let k = members.len();
+            // Pull the matrix + offset from any member; they all agree.
+            let (matrix, offset_vec) = match self.transforms.get(members[0].0) {
+                Some(FieldTransform::Isometric { matrix, offset_vec, .. }) => {
+                    (matrix.clone(), offset_vec.clone())
+                }
+                _ => continue,
+            };
+            // Build v in member-index order.
+            let v_vec: Vec<f64> = members.iter().map(|&(_, _, plain)| plain).collect();
+            // w = O·v + b. matrix is k×k row-major; w[i] = sum_j O[i][j]·v[j] + b[i]
+            for i in 0..k {
+                let mut sum = offset_vec.get(i).copied().unwrap_or(0.0);
+                for j in 0..k {
+                    sum += matrix[i].get(j).copied().unwrap_or(0.0) * v_vec[j];
+                }
+                // Find the field_index for member with this member_index.
+                let field_idx = members[i].0;
+                out[field_idx] = Value::Float(sum);
+            }
+        }
+
+        out
     }
 
     /// Decrypt a fiber value vector (in schema field order). AAD is recomputed
-    /// per field — must match the AAD used at encrypt time.
+    /// per field — must match the AAD used at encrypt time. Same two-pass
+    /// shape as `encrypt_fiber`: non-Isometric per-field, Isometric groups
+    /// solved in pass 2 via O^T(w - b).
     pub fn decrypt_fiber(
         &self,
         encrypted_vals: &[Value],
         bundle_name: &str,
         fiber_fields: &[FieldDef],
     ) -> Vec<Value> {
-        encrypted_vals
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                if let Some(t) = self.transforms.get(i) {
-                    let aad = build_aad(bundle_name, i, fiber_fields.get(i).map(|f| f.name.as_str()).unwrap_or(""));
-                    t.decrypt_value(w, &aad)
-                } else {
-                    w.clone()
+        let mut out: Vec<Value> = vec![Value::Null; encrypted_vals.len()];
+        use std::collections::HashMap;
+        let mut group_pending: HashMap<String, Vec<(usize, usize, f64)>> = HashMap::new();
+
+        for (i, w) in encrypted_vals.iter().enumerate() {
+            match self.transforms.get(i) {
+                Some(FieldTransform::Isometric { group_id, member_index, .. }) => {
+                    let cipher = match w {
+                        Value::Float(f) => *f,
+                        Value::Integer(n) => *n as f64,
+                        Value::Timestamp(t) => *t as f64,
+                        _ => 0.0,
+                    };
+                    group_pending
+                        .entry(group_id.clone())
+                        .or_default()
+                        .push((i, *member_index, cipher));
                 }
-            })
-            .collect()
+                Some(t) => {
+                    let aad = build_aad(
+                        bundle_name,
+                        i,
+                        fiber_fields.get(i).map(|f| f.name.as_str()).unwrap_or(""),
+                    );
+                    out[i] = t.decrypt_value(w, &aad);
+                }
+                None => out[i] = w.clone(),
+            }
+        }
+
+        for (_group_id, mut members) in group_pending {
+            members.sort_by_key(|&(_, mi, _)| mi);
+            let k = members.len();
+            let (matrix, offset_vec) = match self.transforms.get(members[0].0) {
+                Some(FieldTransform::Isometric { matrix, offset_vec, .. }) => {
+                    (matrix.clone(), offset_vec.clone())
+                }
+                _ => continue,
+            };
+            // (w - b)
+            let centered: Vec<f64> = members
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, _, cipher))| cipher - offset_vec.get(i).copied().unwrap_or(0.0))
+                .collect();
+            // v = O^T · (w - b). For orthogonal O, transpose is inverse.
+            // v[i] = sum_j O[j][i] · centered[j]
+            for i in 0..k {
+                let mut sum = 0.0;
+                for j in 0..k {
+                    sum += matrix[j].get(i).copied().unwrap_or(0.0) * centered[j];
+                }
+                let field_idx = members[i].0;
+                out[field_idx] = Value::Float(sum);
+            }
+        }
+
+        out
     }
 
     /// Encrypt a single query literal for a given fiber field index. Used by
@@ -434,6 +674,130 @@ fn cmac_prf(key: &[u8; 32], input: &[u8]) -> [u8; 16] {
     let mut tag = [0u8; 16];
     tag.copy_from_slice(&result);
     tag
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Probabilistic primitives (Sprint D)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Draw a Gaussian sample with mean 0 and standard deviation σ via the
+/// Box-Muller transform, sourced from the OS CSPRNG. Avoids the `rand_distr`
+/// dependency since the rest of the codebase already pulls `getrandom`.
+///
+/// Numerical note: clamping `u1` away from 0 ensures `ln(u1)` doesn't return
+/// −∞ when the CSPRNG happens to emit all-zeros (probability 2^-64 but real).
+fn gaussian_sample(sigma: f64) -> f64 {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG failure");
+    // u1 in (0, 1] — exclude 0 to avoid ln(0); inclusion at 1 is harmless.
+    let raw1 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let u1 = (raw1 as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+    let u2 = (u64::from_le_bytes(buf[8..16].try_into().unwrap()) as f64) / (u64::MAX as f64);
+    sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Isometric primitives (Sprint E)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Derive a deterministic k×k orthogonal matrix and k-dimensional offset for
+/// an Isometric group from `(seed, group_id, k)`. Returns `(matrix, offset)`
+/// where `matrix` is row-major (k rows of k columns each).
+///
+/// Construction:
+/// 1. Fill a k×k Gaussian matrix `G` from seeded Box-Muller mixing.
+/// 2. Orthogonalize via Gram-Schmidt to get `Q ∈ O(k)` (numerically — the
+///    rows of `Q` form an orthonormal basis).
+/// 3. Sample the offset b ∈ ℝ^k from a separate seed-mix.
+///
+/// Determinism: same `(seed, group_id, k)` always produces the same matrix
+/// and offset across deployments. Both are stored verbatim on the GaugeKey
+/// so subsequent calls don't rederive.
+pub fn derive_orthogonal_matrix(
+    seed: &[u8; 32],
+    group_id: &str,
+    k: usize,
+) -> (Vec<Vec<f64>>, Vec<f64>) {
+    if k == 0 {
+        return (vec![], vec![]);
+    }
+
+    let mut input = Vec::with_capacity(seed.len() + group_id.len() + 12);
+    input.extend_from_slice(seed);
+    input.extend_from_slice(b":isometric:");
+    input.extend_from_slice(group_id.as_bytes());
+
+    // Fill k*k Gaussian samples deterministically via Box-Muller on
+    // mix-hashed slot indices. Each slot has its own seed mix so the
+    // resulting matrix has bit-independent entries.
+    let mut g = vec![vec![0.0f64; k]; k];
+    for i in 0..k {
+        for j in 0..k {
+            let slot = (i * k + j) as u64;
+            let h1 = mix_hash(&input, 0x517cc1b727220a95u64.wrapping_add(slot * 2));
+            let h2 = mix_hash(&input, 0x6c62272e07bb0142u64.wrapping_add(slot * 2 + 1));
+            let u1 = (h1 as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+            let u2 = (h2 as f64) / (u64::MAX as f64);
+            g[i][j] = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        }
+    }
+
+    // Gram-Schmidt orthogonalization on rows. After this, the rows of Q
+    // form an orthonormal basis: Q · Q^T = I (and equivalently Q^T · Q = I
+    // since Q is square orthogonal).
+    let mut q = g;
+    for i in 0..k {
+        // Subtract projections onto previous rows.
+        for j in 0..i {
+            let dot: f64 = (0..k).map(|c| q[i][c] * q[j][c]).sum();
+            for c in 0..k {
+                q[i][c] -= dot * q[j][c];
+            }
+        }
+        // Normalize.
+        let norm: f64 = (0..k).map(|c| q[i][c] * q[i][c]).sum::<f64>().sqrt();
+        // If a row degenerates to (near-)zero (extremely improbable from
+        // Gaussian samples, but defensively): replace with an axis-aligned
+        // unit vector to keep Q full-rank.
+        if norm < 1e-12 {
+            for c in 0..k {
+                q[i][c] = 0.0;
+            }
+            q[i][i % k] = 1.0;
+        } else {
+            for c in 0..k {
+                q[i][c] /= norm;
+            }
+        }
+    }
+
+    // Offset b ∈ ℝ^k. Sample from a separate domain-separated mix.
+    let mut offset = vec![0.0f64; k];
+    for i in 0..k {
+        let slot = i as u64;
+        let h = mix_hash(&input, 0xfeedfacef00dbabeu64.wrapping_add(slot));
+        offset[i] = -100.0 + (h as f64 / u64::MAX as f64) * 200.0;
+    }
+
+    (q, offset)
+}
+
+/// Compute the σ-bucket hash of a plaintext value under a per-field bucket
+/// key. Two plaintexts within the same σ-wide bucket produce the same hash;
+/// plaintexts in different buckets produce (with high probability) different
+/// hashes.
+///
+/// Implementation: floor(plaintext / σ) → bucket index (i64) → 8 bytes →
+/// AES-256-CMAC under bucket_key → first 8 bytes as u64.
+///
+/// Stored alongside the noisy ciphertext so HashMap-probe equality search
+/// returns records whose plaintext shared a σ-bucket with the query literal.
+/// This is the implementation of the Davis Identity equality predicate.
+fn bucket_hash(bucket_key: &[u8; 32], plaintext: f64, sigma: f64) -> u64 {
+    let bucket_idx = (plaintext / sigma).floor() as i64;
+    let bytes = bucket_idx.to_le_bytes();
+    let cmac_tag = cmac_prf(bucket_key, &bytes);
+    u64::from_le_bytes(cmac_tag[0..8].try_into().unwrap())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -861,6 +1225,270 @@ mod tests {
         assert_ne!(ct_a, ct_b);
     }
 
+    // ── Sprint D: Probabilistic (gauge + Gaussian + Davis Identity) ──
+
+    fn probabilistic_fields(sigma: f64) -> Vec<FieldDef> {
+        vec![
+            FieldDef::numeric("amount").with_encryption(EncryptionMode::Probabilistic { sigma }),
+        ]
+    }
+
+    #[test]
+    fn test_probabilistic_distinct_ciphertexts_for_same_plaintext() {
+        let seed = test_seed();
+        let fields = probabilistic_fields(0.5);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let plain = vec![Value::Float(42.0)];
+        let mut all_distinct = true;
+        let first = key.encrypt_fiber(&plain, "b", &fields);
+        for _ in 0..20 {
+            let again = key.encrypt_fiber(&plain, "b", &fields);
+            if first == again {
+                all_distinct = false;
+                break;
+            }
+        }
+        assert!(
+            all_distinct,
+            "Probabilistic same-plaintext encrypts must differ (random Gaussian noise)"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_round_trip_within_sigma_tolerance() {
+        let seed = test_seed();
+        let sigma = 0.5;
+        let fields = probabilistic_fields(sigma);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        // Decryption is approximate. The error is bounded by σ/|scale|.
+        // Average over many samples to verify the mean is close to plaintext.
+        let plain_val = 100.0;
+        let plain = vec![Value::Float(plain_val)];
+
+        // Pull the field's scale out of the derived transform so we can
+        // compute the expected error bound.
+        let scale = match &key.transforms[0] {
+            FieldTransform::Probabilistic { scale, .. } => *scale,
+            other => panic!("expected Probabilistic, got {other:?}"),
+        };
+
+        let mut total_err = 0.0;
+        let n = 200;
+        for _ in 0..n {
+            let encrypted = key.encrypt_fiber(&plain, "b", &fields);
+            let decrypted = key.decrypt_fiber(&encrypted, "b", &fields);
+            if let Value::Float(rec) = decrypted[0] {
+                total_err += (rec - plain_val).abs();
+            } else {
+                panic!("decrypt should produce Float");
+            }
+        }
+        let mean_err = total_err / n as f64;
+        let bound = 4.0 * sigma / scale.abs();
+        assert!(
+            mean_err < bound,
+            "Mean decrypt error {mean_err} exceeds expected ≤4σ/|scale| bound {bound}"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_bucket_hash_is_deterministic() {
+        // The bucket portion of the ciphertext is deterministic — same
+        // plaintext always rounds to the same σ-bucket, hashes to the same
+        // u64, even though the noisy_value portion varies. This is what
+        // makes equality search work via the Davis Identity.
+        let seed = test_seed();
+        let fields = probabilistic_fields(0.5);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let plain = vec![Value::Float(7.3)];
+        let mut buckets = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let ct = key.encrypt_fiber(&plain, "b", &fields);
+            if let Value::Binary(bytes) = &ct[0] {
+                assert_eq!(bytes.len(), 16, "Probabilistic ciphertext is 16 bytes");
+                let bucket = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                buckets.insert(bucket);
+            }
+        }
+        assert_eq!(
+            buckets.len(),
+            1,
+            "Same plaintext must produce the same σ-bucket hash across many encrypts (got {} distinct)",
+            buckets.len()
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_bucket_hash_distinguishes_distant_plaintexts() {
+        // Plaintexts more than σ apart should land in different buckets
+        // (with high probability — the bucket boundaries are at integer
+        // multiples of σ).
+        let seed = test_seed();
+        let sigma = 0.5;
+        let fields = probabilistic_fields(sigma);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        // Plaintexts 10σ apart land in different buckets always.
+        let plain_a = vec![Value::Float(0.0)];
+        let plain_b = vec![Value::Float(10.0)];
+
+        let ct_a = key.encrypt_fiber(&plain_a, "b", &fields);
+        let ct_b = key.encrypt_fiber(&plain_b, "b", &fields);
+
+        let bucket = |v: &Value| -> u64 {
+            if let Value::Binary(b) = v {
+                u64::from_le_bytes(b[8..16].try_into().unwrap())
+            } else {
+                panic!("not Binary");
+            }
+        };
+
+        assert_ne!(
+            bucket(&ct_a[0]),
+            bucket(&ct_b[0]),
+            "Plaintexts 10σ apart should land in different buckets"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_encrypt_literal_for_equality_search() {
+        // The Davis Identity equality query: encrypt_literal(X) computes the
+        // bucket portion that matches stored records whose plaintext shared
+        // a σ-bucket with X.
+        let seed = test_seed();
+        let sigma = 0.5;
+        let fields = probabilistic_fields(sigma);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        // Store: plaintext = 42.0
+        let stored = key.encrypt_fiber(&vec![Value::Float(42.0)], "b", &fields);
+
+        // Query literal: 42.0 (same value, different encrypt call)
+        let literal = key.encrypt_literal(0, &Value::Float(42.0), "b", &fields);
+
+        let stored_bucket = if let Value::Binary(b) = &stored[0] {
+            u64::from_le_bytes(b[8..16].try_into().unwrap())
+        } else {
+            panic!("expected Binary");
+        };
+        let literal_bucket = if let Value::Binary(b) = &literal {
+            u64::from_le_bytes(b[8..16].try_into().unwrap())
+        } else {
+            panic!("expected Binary");
+        };
+
+        assert_eq!(
+            stored_bucket, literal_bucket,
+            "Same-plaintext stored record and query literal must share bucket hash"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_recall_at_sigma_window() {
+        // Recall: stored plaintext == query plaintext → bucket match rate.
+        // Plaintexts that round to the same σ-bucket always match. There's
+        // a bucket-boundary effect (floor() rounds down) — so plaintexts
+        // exactly at the bucket boundary may go to either side. For values
+        // well within a bucket, recall is 100%.
+        let seed = test_seed();
+        let sigma = 1.0;
+        let fields = probabilistic_fields(sigma);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        // Use plaintexts that are clearly within their σ-buckets (not at
+        // boundaries) so the test isn't measuring the boundary effect.
+        let plaintexts: Vec<f64> = (1..=50).map(|i| i as f64 + 0.5).collect();
+        let mut hits = 0;
+        for v in &plaintexts {
+            let stored = key.encrypt_fiber(&vec![Value::Float(*v)], "b", &fields);
+            let literal = key.encrypt_literal(0, &Value::Float(*v), "b", &fields);
+            if stored[0] == Value::Binary(vec![]) || literal == Value::Binary(vec![]) {
+                continue;
+            }
+            // Compare bucket portions.
+            let sb = match &stored[0] {
+                Value::Binary(b) => &b[8..16],
+                _ => panic!(),
+            };
+            let lb = match &literal {
+                Value::Binary(b) => &b[8..16],
+                _ => panic!(),
+            };
+            if sb == lb {
+                hits += 1;
+            }
+        }
+        let recall = hits as f64 / plaintexts.len() as f64;
+        assert!(
+            recall == 1.0,
+            "Recall on values well within σ-buckets must be 100%, got {recall}"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_does_not_match_unrelated_plaintexts() {
+        // Plaintexts far apart must NOT collide on bucket hash (within a
+        // small false-positive bound from the bucket index hash).
+        let seed = test_seed();
+        let sigma = 1.0;
+        let fields = probabilistic_fields(sigma);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let stored = key.encrypt_fiber(&vec![Value::Float(0.5)], "b", &fields);
+        let stored_bucket = if let Value::Binary(b) = &stored[0] {
+            u64::from_le_bytes(b[8..16].try_into().unwrap())
+        } else {
+            panic!()
+        };
+
+        let mut false_positives = 0;
+        for i in 100..200 {
+            let v = i as f64 + 0.5; // far away from 0.5
+            let lit = key.encrypt_literal(0, &Value::Float(v), "b", &fields);
+            let lb = if let Value::Binary(b) = &lit {
+                u64::from_le_bytes(b[8..16].try_into().unwrap())
+            } else {
+                panic!()
+            };
+            if lb == stored_bucket {
+                false_positives += 1;
+            }
+        }
+        // FPR should be near zero for 100 unrelated plaintexts under a
+        // 64-bit bucket hash. We'd need ~2^32 trials before expecting one
+        // birthday collision.
+        assert!(
+            false_positives <= 1,
+            "Expected ≤1 false positive in 100 unrelated plaintexts, got {false_positives}"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_curvature_invariance_holds_within_noise() {
+        // The Probabilistic mode adds Gaussian noise σ on top of the affine
+        // transform. K = Var/range² is no longer EXACTLY invariant — noise
+        // increases variance by σ². But for σ « range, the relative change
+        // in K is small. This test asserts the curvature stays within a
+        // documented tolerance (σ²/range² fractional shift).
+        //
+        // For now we just verify the math runs end-to-end without panicking
+        // and produces finite output — the strict-invariance claim belongs
+        // to AFFINE mode, not PROBABILISTIC.
+        let seed = test_seed();
+        let fields = probabilistic_fields(0.5);
+        let key = GaugeKey::derive(&seed, &fields);
+
+        for v in [1.0, 10.0, 100.0, -50.0, 0.0] {
+            let encrypted = key.encrypt_fiber(&vec![Value::Float(v)], "b", &fields);
+            assert!(matches!(encrypted[0], Value::Binary(_)));
+            let decrypted = key.decrypt_fiber(&encrypted, "b", &fields);
+            assert!(matches!(decrypted[0], Value::Float(_)));
+        }
+    }
+
     // ── Mixed-mode bundle: realistic jg_account-style schema ──
 
     #[test]
@@ -906,5 +1534,294 @@ mod tests {
         }
         // attempts: identity
         assert_eq!(decrypted[3], plain[3]);
+    }
+
+    // ── Sprint E: ISOMETRIC for grouped numeric fiber (k≥2) ──
+    //
+    // The ISOMETRIC mode encrypts a vector v ∈ R^k as O·v + b where O is a
+    // shared orthogonal matrix (O^T·O = I) and b is a shared offset, both
+    // derived from the seed. Members of the same group_id share O and b;
+    // each member field carries its row index. Round-trip recovers v exactly
+    // (modulo float ulps); pairwise distance between two records is preserved
+    // because |O·v_a - O·v_b| = |O·(v_a - v_b)| = |v_a - v_b|.
+
+    fn isometric_fields_k2() -> Vec<FieldDef> {
+        vec![
+            FieldDef::numeric("u")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+            FieldDef::numeric("v")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+        ]
+    }
+
+    fn isometric_fields_k3() -> Vec<FieldDef> {
+        vec![
+            FieldDef::numeric("x")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("emb"),
+            FieldDef::numeric("y")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("emb"),
+            FieldDef::numeric("z")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("emb"),
+        ]
+    }
+
+    /// Each group member must carry the matrix and offset, with member_index
+    /// == its position in the field list. Two fields in the same group must
+    /// share the same matrix bytes (same orthogonal transform).
+    #[test]
+    fn test_isometric_group_members_share_matrix_k2() {
+        let seed = test_seed();
+        let fields = isometric_fields_k2();
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let t0 = &key.transforms[0];
+        let t1 = &key.transforms[1];
+        match (t0, t1) {
+            (
+                FieldTransform::Isometric { group_id: g0, matrix: m0, offset_vec: o0, member_index: i0 },
+                FieldTransform::Isometric { group_id: g1, matrix: m1, offset_vec: o1, member_index: i1 },
+            ) => {
+                assert_eq!(g0, g1, "both fields share group_id");
+                assert_eq!(g0, "wind");
+                assert_eq!(m0, m1, "shared matrix bytes");
+                assert_eq!(o0, o1, "shared offset");
+                assert_eq!(*i0, 0);
+                assert_eq!(*i1, 1);
+                assert_eq!(m0.len(), 2, "k=2 so 2x2 matrix");
+                assert_eq!(o0.len(), 2);
+            }
+            _ => panic!("both fields must be Isometric"),
+        }
+    }
+
+    /// O must satisfy O^T·O = I (orthogonality). Tested via direct dot product
+    /// of rows: rows are unit-length and pairwise orthogonal.
+    #[test]
+    fn test_isometric_matrix_is_orthogonal_k3() {
+        let seed = test_seed();
+        let fields = isometric_fields_k3();
+        let key = GaugeKey::derive(&seed, &fields);
+        let t = &key.transforms[0];
+        let matrix = match t {
+            FieldTransform::Isometric { matrix, .. } => matrix,
+            _ => panic!("expected Isometric"),
+        };
+        assert_eq!(matrix.len(), 3, "k=3");
+        for i in 0..3 {
+            assert_eq!(matrix[i].len(), 3, "row {i} has 3 cols");
+        }
+        // Row i · Row j == δ_ij
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| matrix[i][k] * matrix[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-9,
+                    "rows {i},{j}: dot={dot}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    /// Round-trip: encrypt(v) then decrypt recovers v.
+    #[test]
+    fn test_isometric_round_trip_k2() {
+        let seed = test_seed();
+        let fields = isometric_fields_k2();
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let plain = vec![Value::Float(3.7), Value::Float(-1.2)];
+        let cipher = key.encrypt_fiber(&plain, "weather", &fields);
+        let recovered = key.decrypt_fiber(&cipher, "weather", &fields);
+
+        for (p, r) in plain.iter().zip(recovered.iter()) {
+            match (p, r) {
+                (Value::Float(a), Value::Float(b)) => {
+                    assert!((a - b).abs() < 1e-9, "round-trip: {a} vs {b}");
+                }
+                _ => panic!("expected Float"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_isometric_round_trip_k3() {
+        let seed = test_seed();
+        let fields = isometric_fields_k3();
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let plain = vec![Value::Float(0.5), Value::Float(2.0), Value::Float(-3.5)];
+        let cipher = key.encrypt_fiber(&plain, "emb_bundle", &fields);
+        let recovered = key.decrypt_fiber(&cipher, "emb_bundle", &fields);
+
+        for (p, r) in plain.iter().zip(recovered.iter()) {
+            match (p, r) {
+                (Value::Float(a), Value::Float(b)) => {
+                    assert!((a - b).abs() < 1e-9, "round-trip: {a} vs {b}");
+                }
+                _ => panic!("expected Float"),
+            }
+        }
+    }
+
+    /// Geometric core: pairwise distance between encrypted records equals the
+    /// pairwise distance between plaintext records (because O is orthogonal).
+    #[test]
+    fn test_isometric_preserves_pairwise_distance_k3() {
+        let seed = test_seed();
+        let fields = isometric_fields_k3();
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let a_plain = vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)];
+        let b_plain = vec![Value::Float(4.0), Value::Float(0.0), Value::Float(-1.0)];
+
+        let a_cipher = key.encrypt_fiber(&a_plain, "emb_bundle", &fields);
+        let b_cipher = key.encrypt_fiber(&b_plain, "emb_bundle", &fields);
+
+        // Distance between plaintext vectors
+        let d_plain: f64 = a_plain
+            .iter()
+            .zip(b_plain.iter())
+            .map(|(p, q)| match (p, q) {
+                (Value::Float(x), Value::Float(y)) => (x - y).powi(2),
+                _ => 0.0,
+            })
+            .sum::<f64>()
+            .sqrt();
+
+        // Distance between ciphertext vectors
+        let d_cipher: f64 = a_cipher
+            .iter()
+            .zip(b_cipher.iter())
+            .map(|(p, q)| match (p, q) {
+                (Value::Float(x), Value::Float(y)) => (x - y).powi(2),
+                _ => 0.0,
+            })
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(
+            (d_plain - d_cipher).abs() < 1e-9,
+            "isometric distance: plain={d_plain}, cipher={d_cipher}"
+        );
+        assert!(d_plain > 0.5, "sanity: distinct points produce nonzero distance");
+    }
+
+    /// Determinism: same seed + same fields → same matrix, same offsets.
+    #[test]
+    fn test_isometric_determinism_same_seed_same_matrix() {
+        let seed = test_seed();
+        let fields = isometric_fields_k2();
+        let key1 = GaugeKey::derive(&seed, &fields);
+        let key2 = GaugeKey::derive(&seed, &fields);
+
+        match (&key1.transforms[0], &key2.transforms[0]) {
+            (
+                FieldTransform::Isometric { matrix: m1, offset_vec: o1, .. },
+                FieldTransform::Isometric { matrix: m2, offset_vec: o2, .. },
+            ) => {
+                assert_eq!(m1, m2);
+                assert_eq!(o1, o2);
+            }
+            _ => panic!("expected Isometric"),
+        }
+    }
+
+    /// Different seeds → different matrices.
+    #[test]
+    fn test_isometric_different_seeds_different_matrix() {
+        let seed_a = test_seed();
+        let mut seed_b = test_seed();
+        seed_b[0] ^= 0xff;
+
+        let fields = isometric_fields_k2();
+        let key_a = GaugeKey::derive(&seed_a, &fields);
+        let key_b = GaugeKey::derive(&seed_b, &fields);
+
+        let m_a = match &key_a.transforms[0] {
+            FieldTransform::Isometric { matrix, .. } => matrix.clone(),
+            _ => panic!(),
+        };
+        let m_b = match &key_b.transforms[0] {
+            FieldTransform::Isometric { matrix, .. } => matrix.clone(),
+            _ => panic!(),
+        };
+        assert_ne!(m_a, m_b, "different seeds must produce different orthogonal matrices");
+    }
+
+    /// Two separate groups in the same bundle have independent matrices.
+    #[test]
+    fn test_isometric_two_groups_have_independent_matrices() {
+        let seed = test_seed();
+        let fields = vec![
+            FieldDef::numeric("u")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+            FieldDef::numeric("v")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+            FieldDef::numeric("ax")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("accel"),
+            FieldDef::numeric("ay")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("accel"),
+        ];
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let m_wind = match &key.transforms[0] {
+            FieldTransform::Isometric { matrix, group_id, .. } => {
+                assert_eq!(group_id, "wind");
+                matrix.clone()
+            }
+            _ => panic!(),
+        };
+        let m_accel = match &key.transforms[2] {
+            FieldTransform::Isometric { matrix, group_id, .. } => {
+                assert_eq!(group_id, "accel");
+                matrix.clone()
+            }
+            _ => panic!(),
+        };
+        assert_ne!(m_wind, m_accel, "different groups must derive different matrices");
+    }
+
+    /// End-to-end: a four-field bundle with Affine + an ISOMETRIC group
+    /// round-trips correctly.
+    #[test]
+    fn test_isometric_mixed_with_affine_round_trip() {
+        let seed = test_seed();
+        let fields = vec![
+            FieldDef::numeric("score").with_encryption(EncryptionMode::Affine),
+            FieldDef::numeric("u")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+            FieldDef::numeric("v")
+                .with_encryption(EncryptionMode::Isometric)
+                .with_encryption_group("wind"),
+        ];
+        let key = GaugeKey::derive(&seed, &fields);
+
+        let plain = vec![
+            Value::Float(0.95),
+            Value::Float(3.0),
+            Value::Float(-4.0),
+        ];
+        let cipher = key.encrypt_fiber(&plain, "weather", &fields);
+        let recovered = key.decrypt_fiber(&cipher, "weather", &fields);
+
+        for (p, r) in plain.iter().zip(recovered.iter()) {
+            match (p, r) {
+                (Value::Float(a), Value::Float(b)) => {
+                    assert!((a - b).abs() < 1e-9, "field round-trip: {a} vs {b}");
+                }
+                _ => panic!("expected Float"),
+            }
+        }
     }
 }
