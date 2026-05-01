@@ -106,10 +106,45 @@ fn evaluate_op(store: &BundleStore, op: &InvariantOp) -> f64 {
         InvariantOp::Confidence => {
             crate::curvature::confidence(crate::curvature::scalar_curvature(store))
         }
+        InvariantOp::Capacity { tau } => {
+            // Davis Law: C = τ/K. Both inputs are gauge-invariant so C
+            // is gauge-invariant too. Curvature comes from field stats
+            // (no fiber decryption); tau is a schema-supplied scalar.
+            crate::curvature::capacity(*tau, crate::curvature::scalar_curvature(store))
+        }
         InvariantOp::SpectralGap => crate::spectral::spectral_gap(store),
         InvariantOp::Beta0 => crate::spectral::betti_numbers(store).0 as f64,
         InvariantOp::Beta1 => crate::spectral::betti_numbers(store).1 as f64,
+        InvariantOp::HolonomyAvg => holonomy_avg_base_only(store),
     }
+}
+
+/// Sprint H-ext2: base-only holonomy proxy.
+///
+/// Holonomy is the rotation accumulated around a closed loop. On the
+/// fiber-bundle base space, holonomy is non-trivial precisely when the
+/// base graph has cycles — β₁ > 0 is necessary; flat connections have
+/// trivial holonomy. The proxy here is the ratio β₁ / (β₀ + 1), which
+/// captures "how cycle-rich is the base graph relative to the number
+/// of disconnected pieces":
+///
+///   - tree-like (β₁ = 0): holonomy_avg = 0  (no loops, trivial holonomy)
+///   - one big component with k cycles: holonomy_avg = k / 2 (high)
+///   - many components, no cycles: holonomy_avg = 0
+///
+/// Both β₀ and β₁ come from the spectral / topology layer, which works
+/// strictly on the base-point graph — fiber values are never read. So
+/// `holonomy_avg` stays inside the no-decrypt structural guarantee.
+///
+/// The full-precision affine-gauge holonomy (with the Γ = Δv/range
+/// connection 1-form) is computed by the `HOLONOMY` top-level GQL
+/// statement, which DOES read fiber values. That statement is the
+/// right tool when the caller is willing to decrypt; this op is the
+/// right tool when "0 bytes decrypted" is the constraint.
+fn holonomy_avg_base_only(store: &BundleStore) -> f64 {
+    let (b0, b1) = crate::spectral::betti_numbers(store);
+    let denom = (b0 as f64) + 1.0;
+    (b1 as f64) / denom
 }
 
 #[cfg(test)]
@@ -241,9 +276,11 @@ mod tests {
         crate::crypto::reset_decrypt_call_count();
         let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::Curvature));
         let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::Confidence));
+        let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::Capacity { tau: 0.1 }));
         let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::SpectralGap));
         let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::Beta0));
         let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::Beta1));
+        let _ = evaluate(&store, &InvariantExpr::Op(InvariantOp::HolonomyAvg));
 
         let calls = crate::crypto::decrypt_call_count();
         assert_eq!(
@@ -371,6 +408,95 @@ mod tests {
                 assert!(where_clause.is_some(), "WHERE must be parsed");
             }
             other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    /// Davis Law: capacity(tau) = tau / curvature. Composition of two
+    /// gauge-invariants → also gauge-invariant. The op accepts tau as a
+    /// schema-supplied scalar and is callable from PROJECT INVARIANT.
+    #[test]
+    fn test_project_invariant_capacity_davis_law() {
+        let store = make_test_store("inv_capacity");
+        let k = crate::curvature::scalar_curvature(&store);
+        let tau = 0.1;
+
+        let v = evaluate(&store, &InvariantExpr::Op(InvariantOp::Capacity { tau }));
+        let expected = crate::curvature::capacity(tau, k);
+        assert_eq!(v, expected, "capacity(tau) must match curvature::capacity(tau, K)");
+        assert!(v.is_finite() && v > 0.0);
+    }
+
+    /// Capacity is gauge-invariant: matches between encrypted and
+    /// plaintext bundles.
+    #[test]
+    fn test_project_invariant_capacity_invariant_under_encryption() {
+        let plain = make_test_store("inv_cap_plain");
+        let enc = make_encrypted_store("inv_cap_enc");
+        let tau = 0.5;
+
+        let cp = evaluate(&plain, &InvariantExpr::Op(InvariantOp::Capacity { tau }));
+        let ce = evaluate(&enc, &InvariantExpr::Op(InvariantOp::Capacity { tau }));
+        assert!(cp.is_finite() && ce.is_finite());
+        // Curvature is gauge-invariant for affine modes; capacity is too.
+        // Allow a small float tolerance for the encrypted-bundle path.
+        assert!(
+            (cp - ce).abs() / cp.abs().max(1e-9) < 1e-6,
+            "capacity(tau)/plain ≈ capacity(tau)/encrypted: cp={cp}, ce={ce}"
+        );
+    }
+
+    /// holonomy_avg is gauge-invariant: matches between encrypted and
+    /// plaintext bundles. The base-only definition guarantees this
+    /// because the base graph is identical in both.
+    #[test]
+    fn test_project_invariant_holonomy_avg_invariant() {
+        let plain = make_test_store("inv_hol_plain");
+        let enc = make_encrypted_store("inv_hol_enc");
+
+        let hp = evaluate(&plain, &InvariantExpr::Op(InvariantOp::HolonomyAvg));
+        let he = evaluate(&enc, &InvariantExpr::Op(InvariantOp::HolonomyAvg));
+        assert!(hp.is_finite() && he.is_finite());
+        assert_eq!(hp, he, "holonomy_avg is base-only and must match exactly");
+    }
+
+    /// PROJECT INVARIANT (capacity(tau)) parses and dispatches.
+    #[test]
+    fn test_project_invariant_capacity_parses() {
+        use crate::parser::parse;
+        let stmt = parse("PROJECT INVARIANT (capacity(0.1)) FROM b").unwrap();
+        match stmt {
+            crate::parser::Statement::ProjectInvariant { expressions, .. } => {
+                assert_eq!(expressions.len(), 1);
+                assert_eq!(expressions[0].0, "capacity(0.1)");
+                match &expressions[0].1 {
+                    InvariantExpr::Op(InvariantOp::Capacity { tau }) => {
+                        assert_eq!(*tau, 0.1);
+                    }
+                    other => panic!("expected Capacity op, got {:?}", other),
+                }
+            }
+            _ => panic!("expected ProjectInvariant"),
+        }
+
+        // Bare `capacity` without (tau) is rejected — the parameter is required.
+        let bad = parse("PROJECT INVARIANT (capacity) FROM b");
+        assert!(bad.is_err(), "capacity without (tau) must error");
+    }
+
+    /// PROJECT INVARIANT (holonomy_avg) parses and dispatches.
+    #[test]
+    fn test_project_invariant_holonomy_avg_parses() {
+        use crate::parser::parse;
+        let stmt = parse("PROJECT INVARIANT (holonomy_avg) FROM b").unwrap();
+        match stmt {
+            crate::parser::Statement::ProjectInvariant { expressions, .. } => {
+                assert_eq!(expressions[0].0, "holonomy_avg");
+                assert!(matches!(
+                    expressions[0].1,
+                    InvariantExpr::Op(InvariantOp::HolonomyAvg)
+                ));
+            }
+            _ => panic!("expected ProjectInvariant"),
         }
     }
 

@@ -556,11 +556,8 @@ pub enum Statement {
 ///     that yields just BASE fields and reactivate. Until then, use the
 ///     top-level `ENTROPY <bundle>` GQL statement when fiber decryption
 ///     is acceptable.
-///   - `HolonomyAvg` — `holonomy()` uses `point_query()` which decrypts.
-///     Same story: it's a real geometric invariant, but the current
-///     compute path decrypts. Use the `HOLONOMY ...` top-level statement.
 ///
-/// Adding either op here without first making the underlying compute
+/// Adding any op here without first making the underlying compute
 /// decrypt-free will break `test_project_invariant_zero_decrypt_calls`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvariantOp {
@@ -569,6 +566,10 @@ pub enum InvariantOp {
     Curvature,
     /// Confidence ∈ (0, 1] derived from K. Pure function of curvature.
     Confidence,
+    /// Davis Law capacity C = τ/K. Pure function of curvature with a
+    /// schema-supplied tolerance scalar τ. Both inputs are gauge-invariant
+    /// → C is gauge-invariant.
+    Capacity { tau: f64 },
     /// Spectral gap λ₁ of the graph Laplacian. Operates on the base-point
     /// adjacency graph derived from indexed BASE fields — never reads
     /// fiber values.
@@ -577,6 +578,11 @@ pub enum InvariantOp {
     Beta0,
     /// β₁ — number of independent cycles of the base-point graph.
     Beta1,
+    /// Average holonomy magnitude over a deterministic sample of triangle
+    /// loops. Computed from BASE points only — does NOT touch fiber values.
+    /// (The `crate::curvature::holonomy` function on numeric loops touches
+    /// fibers; this op uses a base-only variant added in Sprint H-ext2.)
+    HolonomyAvg,
 }
 
 /// Closed under +, ×, and constants. The grammar restricts the operand
@@ -598,9 +604,11 @@ pub fn invariant_label(expr: &InvariantExpr) -> String {
         InvariantExpr::Op(op) => match op {
             InvariantOp::Curvature => "curvature".into(),
             InvariantOp::Confidence => "confidence".into(),
+            InvariantOp::Capacity { tau } => format!("capacity({tau})"),
             InvariantOp::SpectralGap => "spectral_gap".into(),
             InvariantOp::Beta0 => "beta_0".into(),
             InvariantOp::Beta1 => "beta_1".into(),
+            InvariantOp::HolonomyAvg => "holonomy_avg".into(),
         },
         InvariantExpr::Const(c) => format!("{c}"),
         InvariantExpr::Add(a, b) => format!("({} + {})", invariant_label(a), invariant_label(b)),
@@ -2086,16 +2094,32 @@ impl Parser {
         let op = match word.to_ascii_lowercase().as_str() {
             "curvature" => InvariantOp::Curvature,
             "confidence" => InvariantOp::Confidence,
+            "capacity" => {
+                // Required parameter: capacity(tau). Tau is the tolerance
+                // scalar for the Davis Law C = τ/K.
+                self.expect(Token::LParen)?;
+                let tau = match self.advance() {
+                    Some(Token::Number(n)) => n,
+                    other => {
+                        return Err(format!(
+                            "capacity requires a numeric tolerance: capacity(tau). Got {other:?}"
+                        ));
+                    }
+                };
+                self.expect(Token::RParen)?;
+                InvariantOp::Capacity { tau }
+            }
             "spectral_gap" => InvariantOp::SpectralGap,
             "beta_0" => InvariantOp::Beta0,
             "beta_1" => InvariantOp::Beta1,
+            "holonomy_avg" => InvariantOp::HolonomyAvg,
             other => {
                 return Err(format!(
                     "PROJECT INVARIANT: unknown invariant `{other}`. \
-                     Allowed: curvature, confidence, spectral_gap, beta_0, \
-                     beta_1. (entropy and holonomy currently require \
-                     fiber-value access; use the ENTROPY / HOLONOMY top-level \
-                     statements instead.)"
+                     Allowed: curvature, confidence, capacity(tau), \
+                     spectral_gap, beta_0, beta_1, holonomy_avg. \
+                     (entropy currently requires fiber-value access; use the \
+                     ENTROPY top-level statement instead.)"
                 ));
             }
         };

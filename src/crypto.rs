@@ -535,29 +535,34 @@ impl GaugeKey {
 // invariant query surface. Negligible runtime cost (one relaxed atomic
 // fetch_add per decrypt) so we leave it on in release builds too.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
-static DECRYPT_CALL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Per-thread decrypt-call counter. Thread-local so concurrent test
+    /// threads don't pollute each other's measurements. Synchronous code
+    /// paths (rotate_key, evaluate, etc.) all run on the calling thread,
+    /// so the count reflects exactly what THAT thread did.
+    static DECRYPT_CALL_COUNTER: Cell<usize> = const { Cell::new(0) };
+}
 
 #[inline]
 fn decrypt_call_counter_inc() {
-    DECRYPT_CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    DECRYPT_CALL_COUNTER.with(|c| c.set(c.get() + 1));
 }
 
-/// Read the global decrypt-call counter. Increments on every
-/// `FieldTransform::decrypt_value` and `GaugeKey::decrypt_fiber` call,
-/// across the entire process. Used by Sprint H tests to assert the
-/// PROJECT INVARIANT execution path triggers zero decrypts.
+/// Read the per-thread decrypt-call counter. Increments on every
+/// `FieldTransform::decrypt_value` and `GaugeKey::decrypt_fiber` call
+/// performed by THIS thread. Used by Sprint H tests to assert the
+/// PROJECT INVARIANT execution path triggers zero decrypts even under
+/// parallel test execution.
 pub fn decrypt_call_count() -> usize {
-    DECRYPT_CALL_COUNTER.load(Ordering::Relaxed)
+    DECRYPT_CALL_COUNTER.with(|c| c.get())
 }
 
-/// Reset the global decrypt-call counter to 0. Tests call this before
-/// each invariant evaluation to get a clean baseline. NOT a thread-safe
-/// transactional reset across concurrent decrypts — the assumption is
-/// that test bodies are single-threaded with respect to this counter.
+/// Reset this thread's decrypt-call counter to 0. Tests call this
+/// before each invariant evaluation to get a clean baseline.
 pub fn reset_decrypt_call_count() {
-    DECRYPT_CALL_COUNTER.store(0, Ordering::Relaxed);
+    DECRYPT_CALL_COUNTER.with(|c| c.set(0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

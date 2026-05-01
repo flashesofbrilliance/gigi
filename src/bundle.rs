@@ -3004,6 +3004,199 @@ impl BundleStore {
         (h_before, h_after_total)
     }
 
+    /// Sprint G page §13: Aff(ℝ) closure rekey for AFFINE-only bundles.
+    ///
+    /// When every encrypted fiber field uses `EncryptionMode::Affine`, the
+    /// rekey transform `ρ_g₂ ∘ ρ_g₁⁻¹` is itself an affine map. Writing
+    /// `ρ_gᵢ(v) = aᵢ·v + bᵢ`, the composition simplifies to:
+    ///
+    ///   ρ_g₂ ∘ ρ_g₁⁻¹(w) = a₂/a₁ · w + (b₂ − b₁·a₂/a₁)
+    ///
+    /// So we can rewrite stored ciphertext directly — without ever
+    /// materializing plaintext in memory — by applying that single
+    /// affine map per stored value. This is the "0 bytes plaintext"
+    /// rekey path the gigi-encrypt page advertises.
+    ///
+    /// Returns `Err` if any encrypted fiber field uses a non-Affine
+    /// mode (Opaque/Indexed/Probabilistic/Isometric have no Aff(ℝ)
+    /// closure — for those, decrypt + re-encrypt is required, which is
+    /// what `rotate_key` does). Use `rotate_key_affine_closure` for the
+    /// fast path on AFFINE-only bundles; fall through to `rotate_key`
+    /// otherwise.
+    ///
+    /// Like `rotate_key`, this rotates BOTH the gauge key and the base-
+    /// space hash seed atomically. Unlike `rotate_key`, it does not
+    /// decrypt — the records' fiber values pass through the rekey loop
+    /// in their stored form, transformed in-place.
+    pub fn rotate_key_affine_closure(
+        &mut self,
+        new_seed: &[u8; 32],
+    ) -> Result<usize, String> {
+        use crate::crypto::{FieldTransform, GaugeKey};
+        use crate::types::EncryptionMode;
+
+        let old_key = self.schema.gauge_key.as_ref().ok_or_else(|| {
+            "rotate_key_affine_closure: bundle has no gauge_key — cannot rotate an unencrypted bundle"
+                .to_string()
+        })?;
+
+        // Pre-flight: every encrypted fiber field must be Affine.
+        for f in &self.schema.fiber_fields {
+            match f.encryption {
+                EncryptionMode::None | EncryptionMode::Affine => {}
+                _ => {
+                    return Err(format!(
+                        "rotate_key_affine_closure: field '{}' uses {:?} which has no Aff(ℝ) closure. \
+                         Use rotate_key (decrypt + re-encrypt) instead.",
+                        f.name, f.encryption
+                    ));
+                }
+            }
+        }
+
+        // Derive new key + new hash seed.
+        let new_gauge_key = GaugeKey::derive(new_seed, &self.schema.fiber_fields);
+        let new_base_seed = base_seed_from_master(new_seed);
+
+        // Compute the per-field affine rekey transforms BEFORE mutating
+        // anything: rekey_w = α·w + β where α = a_new/a_old, β = b_new - b_old·α.
+        // For Identity-mode fields (no encryption), α=1, β=0.
+        let mut rekey: Vec<(f64, f64)> = Vec::with_capacity(self.schema.fiber_fields.len());
+        for (i, _) in self.schema.fiber_fields.iter().enumerate() {
+            let (a_old, b_old) = match old_key.transforms.get(i) {
+                Some(FieldTransform::Affine { scale, offset }) => (*scale, *offset),
+                Some(FieldTransform::Identity) | None => (1.0, 0.0),
+                _ => unreachable!("non-Affine variant slipped past pre-flight check"),
+            };
+            let (a_new, b_new) = match new_gauge_key.transforms.get(i) {
+                Some(FieldTransform::Affine { scale, offset }) => (*scale, *offset),
+                Some(FieldTransform::Identity) | None => (1.0, 0.0),
+                _ => unreachable!("non-Affine variant slipped past pre-flight check"),
+            };
+            let alpha = a_new / a_old;
+            let beta = b_new - b_old * alpha;
+            rekey.push((alpha, beta));
+        }
+
+        // Atomic-swap rebuild: walk every (base_point, ciphertext-fiber)
+        // pair from the OLD storage, apply the per-field affine rekey
+        // directly to ciphertext (no decrypt), and insert into a fresh
+        // BundleStore at the NEW base point. We materialize the rekeyed
+        // values via the public `with_hash_config` constructor.
+        let mut new_schema = self.schema.clone();
+        new_schema.gauge_key = Some(new_gauge_key);
+        let mut new_store = BundleStore::with_hash_config(
+            new_schema,
+            crate::hash::HashConfig::from_schema_with_base_seed(&self.schema, new_base_seed),
+        );
+
+        // Iterate raw stored pairs without going through records()
+        // (which would decrypt). For each base point, we still need
+        // to materialize a Record so we can re-hash under the new
+        // HashConfig. The base fields ARE plaintext (never encrypted)
+        // so reading them is fine. The fiber values are CIPHERTEXT;
+        // we pass them through the affine rekey transform and write
+        // them directly. NO call to gauge_key.encrypt_fiber on the
+        // way in — we install the rekeyed cipher into storage as if
+        // it had been encrypted by the new key (which, by Aff(ℝ)
+        // closure, it has been).
+        let count = self.rekey_records_into_affine(&rekey, &mut new_store)?;
+
+        *self = new_store;
+        Ok(count)
+    }
+
+    /// Internal helper for rotate_key_affine_closure: walks self's stored
+    /// (base_vals, fiber_cipher) pairs and inserts rekeyed-cipher records
+    /// into `dest` without decrypting fiber values along the way.
+    fn rekey_records_into_affine(
+        &self,
+        rekey: &[(f64, f64)],
+        dest: &mut BundleStore,
+    ) -> Result<usize, String> {
+        use crate::types::Value;
+
+        // Iterate the storage at the raw level: (BasePoint, [base_vals], [fiber_cipher_vals]).
+        let pairs: Vec<(Vec<Value>, Vec<Value>)> = match &self.storage {
+            BaseStorage::Hashed { sections, base_values } => {
+                let mut out = Vec::new();
+                for (bp, fiber) in sections.iter() {
+                    let base = base_values.get(bp).cloned().unwrap_or_default();
+                    out.push((base, fiber.clone()));
+                }
+                out
+            }
+            BaseStorage::Sequential { sections, base_values, .. }
+            | BaseStorage::Hybrid { sections, base_values, .. } => {
+                let n = sections.len();
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    if let (Some(fiber), Some(base)) = (sections.get(i), base_values.get(i)) {
+                        out.push((base.clone(), fiber.clone()));
+                    }
+                }
+                out
+            }
+        };
+
+        let mut count = 0;
+        for (base_vals, fiber_cipher) in pairs {
+            // Rekey each fiber slot in-place: rekeyed = α · cipher + β.
+            // For non-numeric fiber values (shouldn't happen since we
+            // pre-flighted Affine on numeric only), pass through.
+            let rekeyed_fiber: Vec<Value> = fiber_cipher
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    let (alpha, beta) = rekey.get(i).copied().unwrap_or((1.0, 0.0));
+                    match w {
+                        Value::Float(f) => Value::Float(alpha * f + beta),
+                        Value::Integer(n) => Value::Float(alpha * (*n as f64) + beta),
+                        Value::Timestamp(t) => Value::Timestamp((alpha * (*t as f64) + beta) as i64),
+                        other => other.clone(),
+                    }
+                })
+                .collect();
+
+            // Build a synthetic record from base_vals so we can re-hash
+            // under the dest's NEW HashConfig. Fiber slots are filled
+            // with the REKEYED ciphertext values (which dest's insert
+            // will encrypt with new_gauge_key — but that re-encrypt
+            // would double-encrypt. So instead we go around insert()
+            // and write directly into dest's storage layer.)
+            //
+            // Simpler approach: bypass insert entirely. Manually compute
+            // the new BasePoint and write to dest.storage.
+            let mut record = Record::new();
+            for (i, fd) in self.schema.base_fields.iter().enumerate() {
+                if let Some(v) = base_vals.get(i) {
+                    record.insert(fd.name.clone(), v.clone());
+                }
+            }
+            // Compute new BasePoint via dest's hash_config (already the
+            // rotated one).
+            let new_bp = dest.hash_config.hash(&record, &dest.schema);
+
+            // Write rekeyed fiber + base directly into dest.storage.
+            // We're effectively performing an "insert without re-encrypting"
+            // that corresponds to one rekey step.
+            match &mut dest.storage {
+                BaseStorage::Hashed { sections, base_values } => {
+                    sections.insert(new_bp, rekeyed_fiber);
+                    base_values.insert(new_bp, base_vals.clone());
+                }
+                BaseStorage::Sequential { sections, base_values, .. }
+                | BaseStorage::Hybrid { sections, base_values, .. } => {
+                    sections.push(rekeyed_fiber);
+                    base_values.push(base_vals.clone());
+                }
+            }
+            dest.bp_reverse.insert(new_bp as u32, new_bp);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// (Backward-compat shim — kept for callers that already had a fully
     /// derived GaugeKey on hand and don't want to also rotate the base
     /// seed. Prefer `rotate_key(new_seed: &[u8; 32])` for new code.)
@@ -7532,54 +7725,41 @@ mod tests {
     /// The Engine guards bundle writes with a write-lock. ROTATE_KEY
     /// also takes the write-lock for the duration of its work. So a
     /// concurrent write call can't race with a rotation — it queues
-    /// until the rotation releases. This test demonstrates the
-    /// invariant via the standard library's RwLock contract: holding a
-    /// write guard on the engine excludes any other write.
+    /// until the rotation releases. We prove this with a deterministic
+    /// `try_write` check: while the rotator holds the write lock, a
+    /// `try_write` from another thread must FAIL (returns Err). After
+    /// the rotator releases, the same `try_write` must SUCCEED.
     #[test]
     fn test_rotate_key_concurrent_writes_block_during_rotation() {
         use std::sync::{Arc, RwLock};
         use std::thread;
-        use std::time::{Duration, Instant};
 
-        let store = make_encrypted_test_store("rotate_conc", 200);
+        let store = make_encrypted_test_store("rotate_conc", 50);
         let lock: Arc<RwLock<BundleStore>> = Arc::new(RwLock::new(store));
         let lock_for_writer = Arc::clone(&lock);
 
-        // Acquire the write lock as the rotator.
+        // Rotator acquires the write lock.
         let rotator_guard = lock.write().unwrap();
 
-        // Spawn a writer that ALSO wants a write lock. It must block
-        // until we release.
-        let started = Instant::now();
-        let writer = thread::spawn(move || {
-            let t0 = Instant::now();
-            let mut g = lock_for_writer.write().unwrap();
-            let waited = t0.elapsed();
-            let mut r = Record::new();
-            r.insert("id".into(), Value::Integer(99999));
-            r.insert("score".into(), Value::Float(7.7));
-            r.insert("level".into(), Value::Float(1.0));
-            g.insert(&r);
-            waited
-        });
-
-        // Hold the rotator's write lock for ~30ms simulating a real
-        // rotation, then drop it.
-        thread::sleep(Duration::from_millis(30));
-        drop(rotator_guard);
-
-        let waited = writer.join().expect("writer thread");
-        // Writer's wait time must be at least the time we held the lock.
+        // While we hold it: any concurrent try_write must fail.
+        let blocked = thread::spawn(move || lock_for_writer.try_write().is_err())
+            .join()
+            .expect("thread panicked");
         assert!(
-            waited >= Duration::from_millis(20),
-            "writer did NOT block on rotation lock: waited only {waited:?}"
+            blocked,
+            "concurrent try_write must be blocked while rotation holds the lock"
         );
-        let total = started.elapsed();
-        assert!(total < Duration::from_secs(5), "test took too long: {total:?}");
 
-        // Sanity: writer's insert succeeded after the lock released.
-        let g = lock.read().unwrap();
-        assert!(g.len() >= 201, "writer's insert must land after rotation");
+        // Drop the rotator lock — concurrent writes must now succeed.
+        drop(rotator_guard);
+        let after_lock = Arc::clone(&lock);
+        let unblocked = thread::spawn(move || after_lock.try_write().is_ok())
+            .join()
+            .expect("thread panicked");
+        assert!(
+            unblocked,
+            "try_write must succeed once rotation releases the lock"
+        );
     }
 
     /// Sprint G-ext: RG flow + entropy monotonicity (ΔS ≥ 0).
@@ -7661,6 +7841,88 @@ mod tests {
                 "record plaintext must round-trip post-rotation"
             );
         }
+    }
+
+    /// Page §13: Aff(ℝ) closure rekey path materializes 0 bytes of plaintext.
+    ///
+    /// For Affine-only bundles, the rekey transform composes directly on
+    /// ciphertext (see `rotate_key_affine_closure`'s doc-comment for the
+    /// algebra). The headline guarantee — "0 bytes plaintext materialized"
+    /// — is enforced structurally: we instrument the global decrypt
+    /// counter and verify it stays at 0 across the rekey.
+    #[test]
+    fn test_rotate_key_affine_closure_zero_decrypt_calls() {
+        let mut store = make_encrypted_test_store("rekey_aff", 100);
+
+        // Snapshot pre-rotation plaintexts so we can verify post-rotation
+        // round-trip.
+        let plain_before: Vec<Record> = store.records().collect();
+
+        // Reset the decrypt counter and rekey via the affine closure path.
+        crate::crypto::reset_decrypt_call_count();
+        let count = store
+            .rotate_key_affine_closure(&[0xafu8; 32])
+            .expect("affine closure rekey must succeed on Affine-only bundle");
+        let calls = crate::crypto::decrypt_call_count();
+
+        assert_eq!(count, 100, "all 100 records rekeyed");
+        assert_eq!(
+            calls, 0,
+            "Aff(ℝ) closure rekey must trigger ZERO decrypts (got {calls}). \
+             This is the structural 0-bytes-plaintext guarantee."
+        );
+
+        // Round-trip: every plaintext is recoverable via the new key.
+        for r in &plain_before {
+            let id = r.get("id").cloned().unwrap();
+            let mut k = Record::new();
+            k.insert("id".into(), id);
+            let after = store
+                .point_query(&k)
+                .expect("record must be findable post-affine-rekey");
+            let s_before = r.get("score").and_then(|v| v.as_f64()).unwrap();
+            let s_after = after.get("score").and_then(|v| v.as_f64()).unwrap();
+            assert!(
+                (s_before - s_after).abs() < 1e-6,
+                "affine rekey round-trip: {s_before} vs {s_after}"
+            );
+        }
+    }
+
+    /// Affine-closure rekey rejects non-Affine encryption modes — pre-flight
+    /// check forces the caller to use the slower decrypt+re-encrypt path.
+    #[test]
+    fn test_rotate_key_affine_closure_rejects_non_affine() {
+        use crate::crypto::GaugeKey;
+        use crate::types::EncryptionMode;
+
+        let schema = BundleSchema::new("mixed_modes")
+            .base(FieldDef::numeric("id"))
+            .fiber(
+                FieldDef::numeric("score")
+                    .with_range(100.0)
+                    .with_encryption(EncryptionMode::Affine),
+            )
+            .fiber(
+                FieldDef::categorical("label")
+                    .with_encryption(EncryptionMode::Opaque),
+            );
+        let mut schema = schema;
+        schema.gauge_key = Some(GaugeKey::derive(&[1u8; 32], &schema.fiber_fields));
+        let mut store = BundleStore::new(schema);
+        let mut r = Record::new();
+        r.insert("id".into(), Value::Integer(1));
+        r.insert("score".into(), Value::Float(1.0));
+        r.insert("label".into(), Value::Text("x".into()));
+        store.insert(&r);
+
+        let result = store.rotate_key_affine_closure(&[2u8; 32]);
+        assert!(result.is_err(), "Opaque field must reject affine closure rekey");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Opaque") || err.contains("no Aff"),
+            "error must explain why: {err}"
+        );
     }
 
     #[test]
