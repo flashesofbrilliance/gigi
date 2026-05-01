@@ -164,6 +164,61 @@ impl Value {
     }
 }
 
+/// Per-field encryption mode declared at `CREATE BUNDLE` time.
+///
+/// v0.2 introduces four named modes alongside the legacy `Affine` (v0.1) path.
+/// The mode is set on each fiber field — base fields are never gauge-encrypted
+/// (the base hash already provides constant-time equality lookup).
+///
+/// Mutual exclusion rules:
+/// - `Affine` and `Probabilistic` both modify numeric values; pick one.
+/// - `Isometric` is only valid on grouped numeric fiber declarations.
+/// - `Probabilistic` requires a numeric field type.
+/// - `Indexed` is conventionally for high-cardinality columns only
+///   (deterministic encryption leaks frequency on low-cardinality data;
+///   the parser warns at schema time when this is detectable).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EncryptionMode {
+    /// No encryption — field stored as plaintext.
+    None,
+    /// v0.1 affine numeric: ρ_g(v) = a·v + b.
+    /// Default for NUMERIC / INTEGER / TIMESTAMP under bundle-level ENCRYPTED.
+    Affine,
+    /// AEAD-randomized (AES-GCM-SIV). Per-record nonce; IND-CPA; not equality-queryable.
+    /// Default for TEXT / CATEGORICAL / BINARY / BOOL under bundle-level ENCRYPTED.
+    Opaque,
+    /// PRF-deterministic (AES-256-CMAC or keyed SipHash). Equality-queryable.
+    /// Frequency-leakage caveat: high-cardinality columns only.
+    Indexed,
+    /// Affine + Gaussian noise with schema-declared σ. Statistical unlinkability +
+    /// queryable equality via Davis Identity. Numeric fields only.
+    Probabilistic { sigma: f64 },
+    /// Orthogonal O(k) gauge on grouped numeric fiber. Pairwise distance preserving.
+    /// Only valid when the field is part of a GROUP declaration.
+    Isometric,
+}
+
+impl EncryptionMode {
+    /// True if this mode actually transforms the stored value.
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, EncryptionMode::None)
+    }
+
+    /// Default mode when bundle-level `ENCRYPTED` is declared without a per-field
+    /// override, given the field's type. Numeric fields get Affine (the v0.1 path);
+    /// text / binary / bool get Opaque (the safe choice). Categorical also
+    /// defaults to Opaque even though Indexed is sometimes desirable — the
+    /// schema author must opt in to Indexed because of the frequency-leakage
+    /// caveat.
+    pub fn default_for_type(field_type: &FieldType) -> Self {
+        match field_type {
+            FieldType::Numeric | FieldType::Timestamp | FieldType::Vector { .. } => EncryptionMode::Affine,
+            FieldType::Categorical | FieldType::OrderedCat { .. } => EncryptionMode::Opaque,
+            FieldType::Binary => EncryptionMode::Opaque,
+        }
+    }
+}
+
 /// Field definition in the schema.
 #[derive(Debug, Clone)]
 pub struct FieldDef {
@@ -174,6 +229,11 @@ pub struct FieldDef {
     pub range: Option<f64>,
     /// Weight in the product metric (default 1.0).
     pub weight: f64,
+    /// Per-field encryption mode (v0.2). Default `None` (plaintext); set to a
+    /// specific mode by the parser when the schema declares one. The
+    /// bundle-level `ENCRYPTED` keyword (v0.1) propagates through to per-field
+    /// `default_for_type` defaults at parse time.
+    pub encryption: EncryptionMode,
 }
 
 impl FieldDef {
@@ -184,6 +244,7 @@ impl FieldDef {
             default: Value::Null,
             range: None,
             weight: 1.0,
+            encryption: EncryptionMode::None,
         }
     }
 
@@ -194,6 +255,7 @@ impl FieldDef {
             default: Value::Null,
             range: None,
             weight: 1.0,
+            encryption: EncryptionMode::None,
         }
     }
 
@@ -204,6 +266,7 @@ impl FieldDef {
             default: Value::Null,
             range: Some(time_scale),
             weight: 1.0,
+            encryption: EncryptionMode::None,
         }
     }
 
@@ -214,6 +277,7 @@ impl FieldDef {
             default: Value::Null,
             range: None,
             weight: 1.0,
+            encryption: EncryptionMode::None,
         }
     }
 
@@ -229,6 +293,13 @@ impl FieldDef {
 
     pub fn with_weight(mut self, weight: f64) -> Self {
         self.weight = weight;
+        self
+    }
+
+    /// Set the encryption mode (v0.2). Defaults to `EncryptionMode::None`
+    /// (plaintext) until the parser sets a specific mode at schema time.
+    pub fn with_encryption(mut self, mode: EncryptionMode) -> Self {
+        self.encryption = mode;
         self
     }
 }

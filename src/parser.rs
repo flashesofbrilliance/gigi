@@ -510,6 +510,12 @@ pub struct FieldSpec {
     pub auto_inc: bool,
     pub unique: bool,
     pub required: bool,
+    /// v0.2: per-field encryption mode declared after `ENCRYPTED` keyword.
+    /// Defaults to `EncryptionMode::None` for fields not declared encrypted.
+    /// When the bundle-level `ENCRYPTED` shorthand is used (v0.1 syntax),
+    /// the parser fills this with `EncryptionMode::default_for_type` after
+    /// the field type is known.
+    pub encryption: crate::types::EncryptionMode,
 }
 
 /// Parsed invariant constraint: INVARIANT field = value +/- tol
@@ -1150,6 +1156,9 @@ impl Parser {
         let mut auto_inc = false;
         let mut unique = false;
         let mut required = false;
+        // v0.2 per-field encryption mode. Defaults to None (plaintext) until
+        // an `ENCRYPTED [MODE]` clause is seen on this field.
+        let mut encryption = crate::types::EncryptionMode::None;
 
         loop {
             if self.is_keyword("RANGE") {
@@ -1183,6 +1192,12 @@ impl Parser {
             } else if self.is_keyword("INDEX") {
                 self.advance();
                 indexed.push(name.clone());
+            } else if self.is_keyword("ENCRYPTED") {
+                self.advance();
+                // Optional explicit mode keyword (v0.2). If absent, the mode
+                // resolves to the type-default at schema-creation time
+                // (see Statement::CreateBundle dispatch).
+                encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
             } else {
                 break;
             }
@@ -1196,7 +1211,105 @@ impl Parser {
             auto_inc,
             unique,
             required,
+            encryption,
         })
+    }
+
+    /// Parse the optional mode keyword that may follow `ENCRYPTED` on a field
+    /// declaration. Recognized: `AFFINE`, `OPAQUE`, `INDEXED`, `PROBABILISTIC SIGMA <n>`,
+    /// `ISOMETRIC`. If no recognized keyword follows, returns the type-default mode
+    /// (numeric → Affine, text/binary → Opaque) so the bare `ENCRYPTED` shorthand
+    /// from v0.1 keeps working.
+    ///
+    /// Validates type-mode compatibility:
+    /// - `PROBABILISTIC` requires a numeric field type (NUMERIC, INTEGER, FLOAT, TIMESTAMP).
+    /// - `INDEXED` requires a text-shaped type (TEXT, VARCHAR, STRING, CATEGORICAL).
+    /// - `AFFINE` requires a numeric field type.
+    /// - `OPAQUE` is universally valid.
+    /// - `ISOMETRIC` is parsed but accepted only on grouped declarations
+    ///   (group enforcement is in the caller; here we just return the mode).
+    fn parse_encryption_mode_after_keyword(
+        &mut self,
+        ftype: &str,
+    ) -> Result<crate::types::EncryptionMode, String> {
+        let ftype_upper = ftype.to_ascii_uppercase();
+        let is_numeric = matches!(
+            ftype_upper.as_str(),
+            "INT" | "INTEGER" | "NUMERIC" | "FLOAT" | "REAL" | "DOUBLE" | "TIMESTAMP" | "DATE"
+        );
+        let is_textish = matches!(
+            ftype_upper.as_str(),
+            "TEXT" | "VARCHAR" | "STRING" | "CATEGORICAL"
+        );
+
+        if self.is_keyword("AFFINE") {
+            self.advance();
+            if !is_numeric {
+                return Err(format!(
+                    "ENCRYPTED AFFINE requires a numeric field type; got {ftype}"
+                ));
+            }
+            Ok(crate::types::EncryptionMode::Affine)
+        } else if self.is_keyword("OPAQUE") {
+            self.advance();
+            Ok(crate::types::EncryptionMode::Opaque)
+        } else if self.is_keyword("INDEXED") {
+            self.advance();
+            if !is_textish {
+                return Err(format!(
+                    "ENCRYPTED INDEXED is for high-cardinality TEXT/CATEGORICAL only; got {ftype}"
+                ));
+            }
+            Ok(crate::types::EncryptionMode::Indexed)
+        } else if self.is_keyword("PROBABILISTIC") {
+            self.advance();
+            if !is_numeric {
+                return Err(format!(
+                    "ENCRYPTED PROBABILISTIC requires a numeric field type; got {ftype}"
+                ));
+            }
+            // Require SIGMA <n> to follow.
+            if !self.is_keyword("SIGMA") {
+                return Err(
+                    "ENCRYPTED PROBABILISTIC requires `SIGMA <n>` to declare noise width".into(),
+                );
+            }
+            self.advance();
+            let sigma = match self.advance() {
+                Some(Token::Number(n)) => n,
+                other => {
+                    return Err(format!(
+                        "Expected numeric SIGMA value after PROBABILISTIC, got {other:?}"
+                    ))
+                }
+            };
+            if !(sigma > 0.0) {
+                return Err(format!(
+                    "SIGMA must be a positive number; got {sigma}"
+                ));
+            }
+            Ok(crate::types::EncryptionMode::Probabilistic { sigma })
+        } else if self.is_keyword("ISOMETRIC") {
+            self.advance();
+            if !is_numeric {
+                return Err(format!(
+                    "ENCRYPTED ISOMETRIC requires a numeric field type; got {ftype}"
+                ));
+            }
+            Ok(crate::types::EncryptionMode::Isometric)
+        } else {
+            // No explicit mode — fall back to the type-default. For numeric
+            // fields this is Affine (v0.1 path); for text/binary it's Opaque.
+            // We resolve here using a synthetic FieldType lookup based on the
+            // declared GQL ftype string.
+            let mode = match ftype_upper.as_str() {
+                "INT" | "INTEGER" | "NUMERIC" | "FLOAT" | "REAL" | "DOUBLE" | "TIMESTAMP" | "DATE" => {
+                    crate::types::EncryptionMode::Affine
+                }
+                _ => crate::types::EncryptionMode::Opaque,
+            };
+            Ok(mode)
+        }
     }
 
     // ── GQL: SECTION (insert / point query) ──
@@ -1919,25 +2032,45 @@ impl Parser {
                 self.expect(Token::RParen)?;
             }
 
-            let spec = FieldSpec {
+            let mut spec = FieldSpec {
                 name: fname,
-                ftype,
+                ftype: ftype.clone(),
                 range,
                 default: None,
                 auto_inc: false,
                 unique: false,
                 required: false,
+                encryption: crate::types::EncryptionMode::None,
             };
 
             if self.is_keyword("BASE") {
                 self.advance();
+                // v0.2: per-field ENCRYPTED [MODE] may appear AFTER the
+                // BASE/FIBER keyword in the SQL-compat syntax. Parse it now
+                // so the mode rides on the spec when we push.
+                if self.is_keyword("ENCRYPTED") {
+                    self.advance();
+                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                }
                 base_fields.push(spec);
             } else if self.is_keyword("FIBER") {
                 self.advance();
+                if self.is_keyword("ENCRYPTED") {
+                    self.advance();
+                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                }
                 fiber_fields.push(spec);
             } else if base_fields.is_empty() {
+                if self.is_keyword("ENCRYPTED") {
+                    self.advance();
+                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                }
                 base_fields.push(spec);
             } else {
+                if self.is_keyword("ENCRYPTED") {
+                    self.advance();
+                    spec.encryption = self.parse_encryption_mode_after_keyword(&ftype)?;
+                }
                 fiber_fields.push(spec);
             }
 
@@ -3412,6 +3545,7 @@ pub fn spec_to_field_def(spec: &FieldSpec) -> crate::types::FieldDef {
     if let Some(ref d) = spec.default {
         fd = fd.with_default(literal_to_value(d));
     }
+    fd = fd.with_encryption(spec.encryption);
     fd
 }
 
@@ -3559,7 +3693,25 @@ pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<E
                     tol: inv.tol,
                 });
             }
+            // v0.1 backwards-compat: if the bundle-level ENCRYPTED flag is
+            // set, propagate type-default modes to every fiber field that
+            // doesn't already have an explicit per-field mode (v0.2 syntax).
+            // This means `CREATE BUNDLE foo (..) ENCRYPTED` keeps doing what
+            // it did in v0.1 (numeric → Affine, others → Opaque) while
+            // mixed-mode v0.2 schemas honor the per-field declarations.
             if *encrypted {
+                for fd in schema.fiber_fields.iter_mut() {
+                    if fd.encryption == crate::types::EncryptionMode::None {
+                        fd.encryption = crate::types::EncryptionMode::default_for_type(&fd.field_type);
+                    }
+                }
+                let seed = crate::crypto::GaugeKey::random_seed();
+                let gk = crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
+                schema.gauge_key = Some(gk);
+            } else if schema.fiber_fields.iter().any(|fd| fd.encryption.is_encrypted()) {
+                // Per-field encryption declared without bundle-level shorthand.
+                // Generate a seed and derive the GaugeKey so the engine has
+                // crypto material on hand for fields that ARE encrypted.
                 let seed = crate::crypto::GaugeKey::random_seed();
                 let gk = crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
                 schema.gauge_key = Some(gk);
@@ -6128,5 +6280,197 @@ mod tests {
             }
             _ => panic!("Expected BatchInsert"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // GIGI Encrypt v0.2 — Sprint A: per-field encryption mode declaration.
+    //
+    // Tests for the GQL surface defined in GIGI_ENCRYPT_v0.2_SPRINT_SPEC.md §3.1.
+    // Verify that `CREATE BUNDLE` accepts per-field `ENCRYPTED [MODE]` clauses,
+    // wires them through to FieldDef::encryption, validates type-mode
+    // compatibility, and preserves v0.1 backwards compat.
+    // ════════════════════════════════════════════════════════════════════════
+
+    use crate::types::EncryptionMode;
+
+    /// Helper: parse a CREATE BUNDLE stmt and return the FieldSpec list (base + fiber).
+    fn parse_create_bundle_specs(sql: &str) -> (Vec<FieldSpec>, Vec<FieldSpec>) {
+        let stmt = parse(sql).unwrap_or_else(|e| panic!("parse failed for {sql}: {e}"));
+        match stmt {
+            Statement::CreateBundle {
+                base_fields, fiber_fields, ..
+            } => (base_fields, fiber_fields),
+            _ => panic!("Expected CreateBundle"),
+        }
+    }
+
+    /// Helper: pick a fiber field by name out of a parsed CreateBundle.
+    fn fiber_field<'a>(fiber: &'a [FieldSpec], name: &str) -> &'a FieldSpec {
+        fiber
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no fiber field named {name}"))
+    }
+
+    #[test]
+    fn test_parse_create_bundle_field_level_opaque() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE acct (id INT BASE, legal_name TEXT FIBER ENCRYPTED OPAQUE)",
+        );
+        assert_eq!(fiber_field(&fiber, "legal_name").encryption, EncryptionMode::Opaque);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_field_level_indexed() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE evt (id INT BASE, kind TEXT FIBER ENCRYPTED INDEXED)",
+        );
+        assert_eq!(fiber_field(&fiber, "kind").encryption, EncryptionMode::Indexed);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_field_level_probabilistic_with_sigma() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE evt (id INT BASE, amount NUMERIC FIBER ENCRYPTED PROBABILISTIC SIGMA 0.5)",
+        );
+        match fiber_field(&fiber, "amount").encryption {
+            EncryptionMode::Probabilistic { sigma } => assert!((sigma - 0.5).abs() < 1e-12),
+            other => panic!("expected Probabilistic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_bundle_field_level_isometric_numeric() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE wind (sid INT BASE, wx NUMERIC FIBER ENCRYPTED ISOMETRIC)",
+        );
+        assert_eq!(fiber_field(&fiber, "wx").encryption, EncryptionMode::Isometric);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_field_level_affine() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED AFFINE)",
+        );
+        assert_eq!(fiber_field(&fiber, "t").encryption, EncryptionMode::Affine);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_default_mode_for_text_is_opaque() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE acct (id INT BASE, legal_name TEXT FIBER ENCRYPTED)",
+        );
+        assert_eq!(fiber_field(&fiber, "legal_name").encryption, EncryptionMode::Opaque);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_default_mode_for_numeric_is_affine() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED)",
+        );
+        assert_eq!(fiber_field(&fiber, "t").encryption, EncryptionMode::Affine);
+    }
+
+    #[test]
+    fn test_parse_create_bundle_v01_compat_no_mode() {
+        // v0.1 syntax: bundle-level ENCRYPTED with no per-field clause.
+        // Per-field encryption stays None at parse time; the engine fills it
+        // in during CreateBundle dispatch using `default_for_type`.
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE m (id INT BASE, t FLOAT FIBER) ENCRYPTED",
+        );
+        assert_eq!(fiber_field(&fiber, "t").encryption, EncryptionMode::None);
+    }
+
+    #[test]
+    fn test_parse_unencrypted_field_is_none() {
+        let (_b, fiber) = parse_create_bundle_specs(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER)",
+        );
+        assert_eq!(fiber_field(&fiber, "t").encryption, EncryptionMode::None);
+    }
+
+    #[test]
+    fn test_parse_rejects_probabilistic_on_text() {
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, label TEXT FIBER ENCRYPTED PROBABILISTIC SIGMA 0.1)",
+        );
+        let err = result.expect_err("PROBABILISTIC on TEXT should be rejected");
+        assert!(
+            err.to_lowercase().contains("probabilistic"),
+            "error should mention PROBABILISTIC, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_indexed_on_numeric() {
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED INDEXED)",
+        );
+        let err = result.expect_err("INDEXED on NUMERIC should be rejected");
+        assert!(
+            err.to_lowercase().contains("indexed"),
+            "error should mention INDEXED, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_affine_on_text() {
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, label TEXT FIBER ENCRYPTED AFFINE)",
+        );
+        let err = result.expect_err("AFFINE on TEXT should be rejected");
+        assert!(
+            err.to_lowercase().contains("affine"),
+            "error should mention AFFINE, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sigma_value_required_with_probabilistic() {
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED PROBABILISTIC)",
+        );
+        let err = result.expect_err("PROBABILISTIC without SIGMA should be rejected");
+        assert!(
+            err.to_lowercase().contains("sigma"),
+            "error should mention SIGMA, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sigma_must_be_positive() {
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED PROBABILISTIC SIGMA 0)",
+        );
+        let err = result.expect_err("SIGMA 0 should be rejected");
+        assert!(
+            err.to_lowercase().contains("sigma") || err.to_lowercase().contains("positive"),
+            "error should mention SIGMA / positive, got: {err}"
+        );
+
+        let result = parse(
+            "CREATE BUNDLE m (id INT BASE, t NUMERIC FIBER ENCRYPTED PROBABILISTIC SIGMA -1)",
+        );
+        result.expect_err("negative SIGMA should be rejected");
+    }
+
+    #[test]
+    fn test_parse_mixed_modes_in_one_bundle() {
+        // The realistic case: jg_account-style schema with a mix of opaque text
+        // fields, indexed text fields, and a numeric field. Every per-field
+        // mode is declared explicitly; bundle-level ENCRYPTED is NOT used.
+        let sql = "CREATE BUNDLE acct (\
+            email TEXT BASE, \
+            legal_name TEXT FIBER ENCRYPTED OPAQUE, \
+            kind TEXT FIBER ENCRYPTED INDEXED, \
+            score NUMERIC FIBER ENCRYPTED AFFINE, \
+            attempts INT FIBER\
+        )";
+        let (_b, fiber) = parse_create_bundle_specs(sql);
+        assert_eq!(fiber_field(&fiber, "legal_name").encryption, EncryptionMode::Opaque);
+        assert_eq!(fiber_field(&fiber, "kind").encryption, EncryptionMode::Indexed);
+        assert_eq!(fiber_field(&fiber, "score").encryption, EncryptionMode::Affine);
+        assert_eq!(fiber_field(&fiber, "attempts").encryption, EncryptionMode::None);
     }
 }

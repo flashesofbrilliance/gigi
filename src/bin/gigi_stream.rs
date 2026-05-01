@@ -1179,6 +1179,7 @@ async fn create_bundle(
             default: default_val,
             range: None,
             weight: 1.0,
+            encryption: gigi::types::EncryptionMode::None,
         };
         if req.schema.keys.contains(field_name) {
             schema = schema.base(fd);
@@ -3263,6 +3264,7 @@ async fn add_field(
         default: default_val,
         range: None,
         weight: 1.0,
+        encryption: gigi::types::EncryptionMode::None,
     };
 
     let mut engine = state.engine.write().unwrap();

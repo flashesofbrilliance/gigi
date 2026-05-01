@@ -604,6 +604,11 @@ fn decode_field_def(data: &[u8], offset: &mut usize) -> io::Result<FieldDef> {
         default,
         range,
         weight,
+        // WAL records were written before the v0.2 encryption-mode field
+        // existed; on load we default to None (plaintext). Bundles created
+        // pre-v0.2 honor the bundle-level gauge_key path independently of
+        // this field, so backwards-compat is preserved.
+        encryption: crate::types::EncryptionMode::None,
     })
 }
 
@@ -623,12 +628,34 @@ fn encode_schema(schema: &BundleSchema) -> Vec<u8> {
         write_string(&mut buf, idx);
     }
     // ── Gauge key (encryption) ──
+    // Marker byte:
+    //   0  = no key
+    //   1  = v0.1 legacy: each transform is [f64 scale | f64 offset] (Affine only)
+    //   2  = v0.2 tagged: each transform has a u8 variant tag followed by
+    //        variant-specific payload (Affine: 16 B scale+offset; Opaque/
+    //        Indexed: 32 B key)
     if let Some(ref gk) = schema.gauge_key {
-        buf.push(1u8);
+        buf.push(2u8);
         buf.extend_from_slice(&(gk.transforms.len() as u32).to_le_bytes());
         for t in &gk.transforms {
-            buf.extend_from_slice(&t.scale.to_le_bytes());
-            buf.extend_from_slice(&t.offset.to_le_bytes());
+            match t {
+                crate::crypto::FieldTransform::Identity => {
+                    buf.push(0x00);
+                }
+                crate::crypto::FieldTransform::Affine { scale, offset } => {
+                    buf.push(0x01);
+                    buf.extend_from_slice(&scale.to_le_bytes());
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                }
+                crate::crypto::FieldTransform::Opaque { key } => {
+                    buf.push(0x02);
+                    buf.extend_from_slice(key);
+                }
+                crate::crypto::FieldTransform::Indexed { key } => {
+                    buf.push(0x03);
+                    buf.extend_from_slice(key);
+                }
+            }
         }
     } else {
         buf.push(0u8);
@@ -671,10 +698,13 @@ fn decode_schema(data: &[u8]) -> io::Result<BundleSchema> {
     }
 
     // ── Gauge key (encryption) — may be absent in old WAL entries ──
+    // Marker byte: 0 = no key, 1 = v0.1 legacy (scale+offset only),
+    // 2 = v0.2 tagged (per-transform variant byte + payload).
     if offset < data.len() {
-        let has_key = data[offset];
+        let marker = data[offset];
         offset += 1;
-        if has_key != 0 {
+        if marker == 1 {
+            // v0.1 backwards-compat: every transform is Affine
             let n = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             let mut transforms = Vec::with_capacity(n);
@@ -683,10 +713,57 @@ fn decode_schema(data: &[u8]) -> io::Result<BundleSchema> {
                 offset += 8;
                 let off_val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                 offset += 8;
-                transforms.push(crate::crypto::FieldTransform { scale, offset: off_val });
+                transforms.push(crate::crypto::FieldTransform::Affine {
+                    scale,
+                    offset: off_val,
+                });
+            }
+            schema.gauge_key = Some(crate::crypto::GaugeKey { transforms });
+        } else if marker == 2 {
+            // v0.2: tagged per-transform variants
+            let n = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let mut transforms = Vec::with_capacity(n);
+            for _ in 0..n {
+                let tag = data[offset];
+                offset += 1;
+                match tag {
+                    0x00 => {
+                        transforms.push(crate::crypto::FieldTransform::Identity);
+                    }
+                    0x01 => {
+                        let scale = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                        offset += 8;
+                        let off_val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                        offset += 8;
+                        transforms.push(crate::crypto::FieldTransform::Affine {
+                            scale,
+                            offset: off_val,
+                        });
+                    }
+                    0x02 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&data[offset..offset + 32]);
+                        offset += 32;
+                        transforms.push(crate::crypto::FieldTransform::Opaque { key });
+                    }
+                    0x03 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&data[offset..offset + 32]);
+                        offset += 32;
+                        transforms.push(crate::crypto::FieldTransform::Indexed { key });
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Unknown FieldTransform tag: {other:#x}"),
+                        ));
+                    }
+                }
             }
             schema.gauge_key = Some(crate::crypto::GaugeKey { transforms });
         }
+        // marker == 0 → no key, fall through
     }
 
     // ── Invariant constraints — may be absent in old WAL entries ──
@@ -799,7 +876,19 @@ mod tests {
     /// WAL-1: gauge_key survives encode → decode (was silently dropped before fix).
     #[test]
     fn schema_roundtrip_with_gauge_key() {
-        let mut schema = test_schema();
+        use crate::types::EncryptionMode;
+        // Test schema with mixed-mode fiber fields so the WAL roundtrip
+        // exercises every FieldTransform variant tag.
+        let mut schema = BundleSchema::new("users")
+            .base(FieldDef::numeric("id"))
+            .fiber(FieldDef::categorical("name").with_encryption(EncryptionMode::Opaque))
+            .fiber(FieldDef::categorical("kind").with_encryption(EncryptionMode::Indexed))
+            .fiber(
+                FieldDef::numeric("salary")
+                    .with_range(100_000.0)
+                    .with_encryption(EncryptionMode::Affine),
+            )
+            .index("name");
         let seed = crate::crypto::GaugeKey::random_seed();
         schema.gauge_key = Some(crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields));
         let n_transforms = schema.gauge_key.as_ref().unwrap().transforms.len();
@@ -807,10 +896,36 @@ mod tests {
         let decoded = decode_schema(&encoded).unwrap();
         let gk = decoded.gauge_key.expect("gauge_key must survive WAL roundtrip");
         assert_eq!(gk.transforms.len(), n_transforms);
+
+        // Each transform variant must roundtrip with its associated material
+        // (scale/offset for Affine, key bytes for Opaque/Indexed).
         let orig = &schema.gauge_key.as_ref().unwrap().transforms;
         for (a, b) in orig.iter().zip(gk.transforms.iter()) {
-            assert!((a.scale - b.scale).abs() < 1e-15);
-            assert!((a.offset - b.offset).abs() < 1e-15);
+            match (a, b) {
+                (
+                    crate::crypto::FieldTransform::Affine { scale: s1, offset: o1 },
+                    crate::crypto::FieldTransform::Affine { scale: s2, offset: o2 },
+                ) => {
+                    assert!((s1 - s2).abs() < 1e-15);
+                    assert!((o1 - o2).abs() < 1e-15);
+                }
+                (
+                    crate::crypto::FieldTransform::Opaque { key: k1 },
+                    crate::crypto::FieldTransform::Opaque { key: k2 },
+                ) => assert_eq!(k1, k2),
+                (
+                    crate::crypto::FieldTransform::Indexed { key: k1 },
+                    crate::crypto::FieldTransform::Indexed { key: k2 },
+                ) => assert_eq!(k1, k2),
+                (
+                    crate::crypto::FieldTransform::Identity,
+                    crate::crypto::FieldTransform::Identity,
+                ) => {}
+                (left, right) => panic!(
+                    "WAL roundtrip changed FieldTransform variant: {:?} → {:?}",
+                    left, right
+                ),
+            }
         }
     }
 

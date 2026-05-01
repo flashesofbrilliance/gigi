@@ -894,7 +894,7 @@ impl BundleStore {
 
         // Apply geometric encryption (gauge transform) if enabled
         let fiber_vals = if let Some(ref gk) = self.schema.gauge_key {
-            gk.encrypt_fiber(&fiber_vals_raw)
+            gk.encrypt_fiber(&fiber_vals_raw, &self.schema.name, &self.schema.fiber_fields)
         } else {
             fiber_vals_raw
         };
@@ -1083,6 +1083,10 @@ impl BundleStore {
             .map(|f| f.default.clone())
             .collect();
         let gauge_key = self.schema.gauge_key.clone();
+        // Capture for AAD construction in the encrypt path; keeps the
+        // closure-borrows below free of `&self.schema` references.
+        let gauge_bundle_name = self.schema.name.clone();
+        let gauge_fiber_fields = self.schema.fiber_fields.clone();
         let is_seq = matches!(self.storage, BaseStorage::Sequential { .. });
         let track_detect = !self.detected;
 
@@ -1147,7 +1151,7 @@ impl BundleStore {
 
                 // Apply geometric encryption if enabled
                 let fiber_vals = if let Some(ref gk) = gauge_key {
-                    gk.encrypt_fiber(&fiber_vals)
+                    gk.encrypt_fiber(&fiber_vals, &gauge_bundle_name, &gauge_fiber_fields)
                 } else {
                     fiber_vals
                 };
@@ -1223,7 +1227,7 @@ impl BundleStore {
 
                 // Apply geometric encryption if enabled
                 let fiber_vals = if let Some(ref gk) = gauge_key {
-                    gk.encrypt_fiber(&fiber_vals)
+                    gk.encrypt_fiber(&fiber_vals, &gauge_bundle_name, &gauge_fiber_fields)
                 } else {
                     fiber_vals
                 };
@@ -1689,7 +1693,7 @@ impl BundleStore {
                     }
                     // Decrypt fiber values if geometric encryption is enabled
                     if let Some(ref gk) = self.schema.gauge_key {
-                        let decrypted = gk.decrypt_fiber(fiber);
+                        let decrypted = gk.decrypt_fiber(fiber, &self.schema.name, &self.schema.fiber_fields);
                         for (i, f) in self.schema.fiber_fields.iter().enumerate() {
                             record.insert(f.name.clone(), decrypted[i].clone());
                         }
@@ -2268,7 +2272,7 @@ impl BundleStore {
         }
         // Decrypt fiber values if geometric encryption is enabled
         if let Some(ref gk) = self.schema.gauge_key {
-            let decrypted = gk.decrypt_fiber(fiber);
+            let decrypted = gk.decrypt_fiber(fiber, &self.schema.name, &self.schema.fiber_fields);
             for (i, field_def) in self.schema.fiber_fields.iter().enumerate() {
                 record.insert(field_def.name.clone(), decrypted[i].clone());
             }
@@ -2413,7 +2417,7 @@ impl BundleStore {
                         }
                         // Decrypt fiber values if geometric encryption is enabled
                         if let Some(ref gk) = gauge_key {
-                            let decrypted = gk.decrypt_fiber(fiber);
+                            let decrypted = gk.decrypt_fiber(fiber, &self.schema.name, &self.schema.fiber_fields);
                             for (j, name) in fiber_names.iter().enumerate() {
                                 if j < decrypted.len() {
                                     record.insert(name.clone(), decrypted[j].clone());
@@ -5225,6 +5229,7 @@ mod tests {
     // ── Geometric Encryption Tests (GEO-ENC-1 through GEO-ENC-15) ──
 
     fn make_encrypted_store() -> BundleStore {
+        use crate::types::EncryptionMode;
         let seed: [u8; 32] = {
             let mut s = [0u8; 32];
             for i in 0..32 {
@@ -5232,11 +5237,26 @@ mod tests {
             }
             s
         };
+        // v0.2: explicit per-field encryption mode (Affine = the v0.1 path).
+        // Required because GaugeKey::derive now dispatches on the field's
+        // declared mode rather than always emitting affine transforms.
         let mut schema = BundleSchema::new("enc_weather")
             .base(FieldDef::numeric("id"))
-            .fiber(FieldDef::numeric("temp").with_range(120.0))
-            .fiber(FieldDef::numeric("humidity").with_range(100.0))
-            .fiber(FieldDef::numeric("pressure").with_range(200.0));
+            .fiber(
+                FieldDef::numeric("temp")
+                    .with_range(120.0)
+                    .with_encryption(EncryptionMode::Affine),
+            )
+            .fiber(
+                FieldDef::numeric("humidity")
+                    .with_range(100.0)
+                    .with_encryption(EncryptionMode::Affine),
+            )
+            .fiber(
+                FieldDef::numeric("pressure")
+                    .with_range(200.0)
+                    .with_encryption(EncryptionMode::Affine),
+            );
         let gk = crate::crypto::GaugeKey::derive(&seed, &schema.fiber_fields);
         schema.gauge_key = Some(gk);
         BundleStore::new(schema)
@@ -5539,11 +5559,23 @@ mod tests {
             s
         };
 
-        let fields = vec![FieldDef::numeric("temp")];
+        use crate::types::EncryptionMode;
+        let fields = vec![
+            FieldDef::numeric("temp").with_encryption(EncryptionMode::Affine),
+        ];
         let k1 = crate::crypto::GaugeKey::derive(&seed1, &fields);
         let k2 = crate::crypto::GaugeKey::derive(&seed2, &fields);
 
-        assert_ne!(k1.transforms[0].scale, k2.transforms[0].scale);
+        // v0.2: pattern-match the Affine variant to inspect scale/offset.
+        let s1 = match &k1.transforms[0] {
+            crate::crypto::FieldTransform::Affine { scale, .. } => *scale,
+            other => panic!("expected Affine, got {:?}", other),
+        };
+        let s2 = match &k2.transforms[0] {
+            crate::crypto::FieldTransform::Affine { scale, .. } => *scale,
+            other => panic!("expected Affine, got {:?}", other),
+        };
+        assert_ne!(s1, s2);
     }
 
     /// GEO-ENC-13: Known-plaintext resistance — knowing one field's transform
@@ -5557,22 +5589,29 @@ mod tests {
             }
             s
         };
+        use crate::types::EncryptionMode;
         let fields = vec![
-            FieldDef::numeric("temp"),
-            FieldDef::numeric("humidity"),
-            FieldDef::numeric("pressure"),
+            FieldDef::numeric("temp").with_encryption(EncryptionMode::Affine),
+            FieldDef::numeric("humidity").with_encryption(EncryptionMode::Affine),
+            FieldDef::numeric("pressure").with_encryption(EncryptionMode::Affine),
         ];
         let key = crate::crypto::GaugeKey::derive(&seed, &fields);
 
-        // Each field transform is independently derived
-        let t0 = &key.transforms[0];
-        let t1 = &key.transforms[1];
-        let t2 = &key.transforms[2];
+        // v0.2: pattern-match each transform to extract scale/offset.
+        fn affine_params(t: &crate::crypto::FieldTransform) -> (f64, f64) {
+            match t {
+                crate::crypto::FieldTransform::Affine { scale, offset } => (*scale, *offset),
+                other => panic!("expected Affine, got {:?}", other),
+            }
+        }
+        let (s0, o0) = affine_params(&key.transforms[0]);
+        let (s1, o1) = affine_params(&key.transforms[1]);
+        let (s2, _o2) = affine_params(&key.transforms[2]);
 
         // All three should be different (field name is mixed into derivation)
-        assert_ne!(t0.scale, t1.scale);
-        assert_ne!(t1.scale, t2.scale);
-        assert_ne!(t0.offset, t1.offset);
+        assert_ne!(s0, s1);
+        assert_ne!(s1, s2);
+        assert_ne!(o0, o1);
     }
 
     /// GEO-ENC-14: GQL ENCRYPTED syntax creates encrypted bundle
@@ -5743,6 +5782,7 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
+                encryption: crate::types::EncryptionMode::None,
             })
             .fiber(FieldDef {
                 name: "emb".into(),
@@ -5750,6 +5790,7 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
+                encryption: crate::types::EncryptionMode::None,
             })
             .fiber(FieldDef {
                 name: "cat".into(),
@@ -5757,6 +5798,7 @@ mod tests {
                 default: Value::Null,
                 range: None,
                 weight: 1.0,
+                encryption: crate::types::EncryptionMode::None,
             });
         let mut store = BundleStore::new(schema);
         // Insert 5 vectors at known positions in 2D
