@@ -5162,9 +5162,11 @@ async fn gql_query(
                     );
                 }
             };
-            let new_key =
-                gigi::crypto::GaugeKey::derive(&new_seed, &store.schema.fiber_fields);
-            match store.rotate_key(new_key) {
+            // Sprint G-ext: rotate_key takes the 32-byte master and
+            // drives both gauge-key and base-hash-seed rotation. The
+            // gauge_key is derived inside the bundle method so the
+            // caller doesn't need to keep them coordinated.
+            match store.rotate_key(&new_seed) {
                 Ok(count) => {
                     emit_quick("ROTATE_KEY", t0.elapsed().as_micros() as u64, false);
                     return (
@@ -5789,13 +5791,18 @@ fn execute_gql_on_store_read(
             // operates strictly on the heap-side BundleStore via base
             // points + field stats — never reads fiber values, so the
             // PROJECT INVARIANT execution path triggers zero decrypts.
-            let _ = where_clause;
             let store_heap = store.as_heap().ok_or_else(|| {
                 "PROJECT INVARIANT requires bundle in heap mode".to_string()
             })?;
             let results: Vec<(String, f64)> = expressions
                 .iter()
-                .map(|(label, expr)| (label.clone(), gigi::invariant::evaluate(store_heap, expr)))
+                .map(|(label, expr)| {
+                    let v = match where_clause {
+                        Some(conds) => gigi::invariant::evaluate_filtered(store_heap, expr, conds),
+                        None => gigi::invariant::evaluate(store_heap, expr),
+                    };
+                    (label.clone(), v)
+                })
                 .collect();
             Ok(ExecResult::Invariants(results))
         }

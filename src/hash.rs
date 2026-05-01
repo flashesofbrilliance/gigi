@@ -47,6 +47,17 @@ impl HashConfig {
     /// Derive per-field seeds from the schema name and field names.
     pub fn from_schema(schema: &BundleSchema) -> Self {
         let base_seed = wy(schema.name.as_bytes(), 0);
+        Self::from_schema_with_base_seed(schema, base_seed)
+    }
+
+    /// Sprint G-ext: same as `from_schema` but uses an explicitly-supplied
+    /// 64-bit base seed instead of deriving it from the schema name. This
+    /// is the entry point for forward-secret base-space hash rotation —
+    /// rotating the base seed re-randomizes which `BasePoint` each key
+    /// hashes to, so an attacker holding the OLD seed can no longer
+    /// resolve plaintext keys to their post-rotation positions in the
+    /// bundle.
+    pub fn from_schema_with_base_seed(schema: &BundleSchema, base_seed: u64) -> Self {
         let seeds = schema
             .base_fields
             .iter()

@@ -4897,28 +4897,23 @@ pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<E
             Ok(ExecResult::Scalar(f))
         }
         Statement::RotateKey { bundle, new_seed_source } => {
-            // Resolve the new seed.
             let new_seed = resolve_seed(new_seed_source)?;
-            // Need mutable heap access — mmap-only bundles can't rotate
-            // in-place (would need a heap upgrade first).
             let store = engine
                 .heap_bundle_mut(bundle)
                 .ok_or_else(|| format!(
                     "ROTATE_KEY requires bundle '{}' to be in heap mode",
                     bundle
                 ))?;
-            // Derive the new GaugeKey against the bundle's current schema.
-            let new_key = crate::crypto::GaugeKey::derive(&new_seed, &store.schema.fiber_fields);
-            let count = store.rotate_key(new_key)?;
+            // Sprint G-ext: rotate_key now drives BOTH the gauge key (g)
+            // and the base-space hash seed (s) from a single 32-byte
+            // master. One call rotates (s, g) → (s', g') atomically.
+            let count = store.rotate_key(&new_seed)?;
             Ok(ExecResult::Count(count))
         }
         Statement::ProjectInvariant { bundle, expressions, where_clause } => {
             let bundle_ref = engine
                 .bundle(bundle)
                 .ok_or_else(|| format!("Bundle '{}' not found", bundle))?;
-            // Invariant computation requires the heap-side BundleStore.
-            // For mmap-only bundles, we'd need an heap upgrade — for v0.2
-            // scope, return an error message rather than silently skipping.
             let store = bundle_ref.as_heap().ok_or_else(|| {
                 format!(
                     "PROJECT INVARIANT requires bundle '{}' to be in heap mode",
@@ -4926,15 +4921,14 @@ pub fn execute(engine: &mut crate::engine::Engine, stmt: &Statement) -> Result<E
                 )
             })?;
 
-            // WHERE clause routes to unfiltered store for now — Sprint H
-            // scope is the parse + dispatch + zero-decrypt guarantee.
-            // Filter-aware invariant is a follow-up.
-            let _ = where_clause;
-
+            // Sprint H-ext: filtered invariant computation.
             let results: Vec<(String, f64)> = expressions
                 .iter()
                 .map(|(label, expr)| {
-                    let v = crate::invariant::evaluate(store, expr);
+                    let v = match where_clause {
+                        Some(conds) => crate::invariant::evaluate_filtered(store, expr, conds),
+                        None => crate::invariant::evaluate(store, expr),
+                    };
                     (label.clone(), v)
                 })
                 .collect();
