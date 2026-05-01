@@ -329,6 +329,29 @@ async function testSprintH() {
       bad('multi-invariant key set wrong', JSON.stringify(r2));
     }
 
+    // Sprint H-ext2: capacity(tau) Davis Law and holonomy_avg
+    // base-only proxy.
+    const r2b = await gql(`PROJECT INVARIANT (capacity(0.1), holonomy_avg) FROM ${b}`);
+    const keys2b = Object.keys(r2b.invariants || {});
+    if (keys2b.includes('capacity(0.1)') && keys2b.includes('holonomy_avg')) {
+      ok(`Davis Law capacity(0.1) + holonomy_avg both shipped in invariant ring`);
+    } else {
+      bad('capacity / holonomy_avg missing from response', JSON.stringify(r2b));
+    }
+    // capacity bare (no tau) must reject at parse — the server returns
+    // a generic "Expected LParen" error from the InvariantOp parser.
+    let capRejected = false;
+    try {
+      await gql(`PROJECT INVARIANT (capacity) FROM ${b}`);
+    } catch (e) {
+      capRejected = /parse|LParen|tau|tolerance/i.test(String(e.message));
+    }
+    if (capRejected) {
+      ok(`capacity without (tau) rejected at parse time`);
+    } else {
+      bad('capacity bare was accepted (parser regression)');
+    }
+
     // Whitelist enforcement: 'sum' must be rejected at parse time.
     let rejected = false;
     try {
