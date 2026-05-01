@@ -19,7 +19,19 @@ primary_region = "iad"
   # bundle is missing, it creates it from this schema. Idempotent — never
   # touches an existing bundle. Add an entry here for any app-required
   # bundle that must survive a Fly volume loss / cross-machine reschedule.
-  GIGI_APP_BUNDLES = '''[{"name":"jg_kv","base":[{"name":"key","type":"text"}],"fiber":[{"name":"kind","type":"text","indexed":true},{"name":"payload","type":"text"},{"name":"expires_at","type":"timestamp","indexed":true},{"name":"updated_at","type":"timestamp","indexed":true}]}]'''
+  # `seed_env` points at a Fly secret (32-byte hex). Set it via:
+  #   flyctl secrets set JG_KV_ENCRYPTION_SEED=$(openssl rand -hex 32)
+  # If unset, the bootstrap falls back to a per-startup random seed —
+  # which is fine for an empty bundle but breaks ciphertext recovery
+  # across redeploys. Production MUST set the secret.
+  #
+  # `payload` is OPAQUE (AEAD) — chat content is the sensitive payload
+  # and we want IND-CPA + tamper detection on it. `key` stays plaintext
+  # because it's the BASE lookup field. `kind`, `expires_at`, `updated_at`
+  # are metadata — leaving them plaintext lets bitmap indexes work and
+  # the small frequency-leak risk on a low-cardinality `kind` is
+  # acceptable for chat-shape metadata.
+  GIGI_APP_BUNDLES = '''[{"name":"jg_kv","seed_env":"JG_KV_ENCRYPTION_SEED","base":[{"name":"key","type":"text"}],"fiber":[{"name":"kind","type":"text","indexed":true},{"name":"payload","type":"text","encrypted":"opaque"},{"name":"expires_at","type":"timestamp","indexed":true},{"name":"updated_at","type":"timestamp","indexed":true}]}]'''
 
 [http_service]
   internal_port = 3142

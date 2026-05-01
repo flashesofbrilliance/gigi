@@ -6520,16 +6520,28 @@ fn init_system_bundles(engine: &mut Engine) {
 /// [
 ///   {
 ///     "name": "jg_kv",
+///     "seed_env": "JG_KV_ENCRYPTION_SEED",
 ///     "base": [{"name": "key", "type": "text"}],
 ///     "fiber": [
 ///       {"name": "kind", "type": "text", "indexed": true},
-///       {"name": "payload", "type": "text"},
+///       {"name": "payload", "type": "text", "encrypted": "opaque"},
 ///       {"name": "expires_at", "type": "timestamp", "indexed": true},
 ///       {"name": "updated_at", "type": "timestamp", "indexed": true}
 ///     ]
 ///   }
 /// ]
 /// ```
+///
+/// Per-field `encrypted` accepts: `"none"` (default), `"affine"`
+/// (numeric only), `"opaque"` (AEAD on text/binary), `"indexed"`
+/// (deterministic PRF on text — high-cardinality only). When ANY
+/// fiber field has a non-`none` mode, the bundle's GaugeKey is
+/// derived at create-time from the seed at `seed_env` (a 32-byte
+/// hex env var). If `seed_env` is missing or unset, the bootstrap
+/// falls back to a random per-startup seed — but that means the
+/// gauge_key changes every redeploy, which would make existing
+/// ciphertext unrecoverable. For production deployments, ALWAYS
+/// set `seed_env` to a stable Fly secret.
 ///
 /// Without the env var, this is a no-op (system bundles still bootstrap).
 /// The check uses `engine.bundle_names()` against the live engine — never
@@ -6583,6 +6595,7 @@ fn init_app_bundles(engine: &mut Engine) {
         let mut schema = BundleSchema::new(name);
         let mut indexed_fields: Vec<String> = Vec::new();
         let mut bad_entry = false;
+        let mut any_field_encrypted = false;
 
         for (section_key, is_base) in [("base", true), ("fiber", false)] {
             if bad_entry { break; }
@@ -6600,7 +6613,7 @@ fn init_app_bundles(engine: &mut Engine) {
                     }
                 };
                 let ftype = f.get("type").and_then(|v| v.as_str()).unwrap_or("text");
-                let def = match ftype.to_ascii_lowercase().as_str() {
+                let mut def = match ftype.to_ascii_lowercase().as_str() {
                     "text" | "string" | "categorical" => FieldDef::categorical(&fname),
                     "numeric" | "int" | "integer" | "float" | "double" | "timestamp" => {
                         FieldDef::numeric(&fname)
@@ -6612,6 +6625,33 @@ fn init_app_bundles(engine: &mut Engine) {
                         FieldDef::categorical(&fname)
                     }
                 };
+
+                // Per-field encryption: only meaningful on FIBER fields
+                // (BASE fields stay plaintext to remain hashable for the
+                // base-point lookup).
+                if !is_base {
+                    if let Some(mode_str) = f.get("encrypted").and_then(|v| v.as_str()) {
+                        let mode = match mode_str.to_ascii_lowercase().as_str() {
+                            "none" | "" => gigi::types::EncryptionMode::None,
+                            "affine" => gigi::types::EncryptionMode::Affine,
+                            "opaque" => gigi::types::EncryptionMode::Opaque,
+                            "indexed" => gigi::types::EncryptionMode::Indexed,
+                            other => {
+                                eprintln!(
+                                    "[app-bundles] {name}.{fname}: unsupported encrypted mode \
+                                     `{other}` — only none/affine/opaque/indexed are supported \
+                                     by the manifest. Falling back to plaintext."
+                                );
+                                gigi::types::EncryptionMode::None
+                            }
+                        };
+                        if !matches!(mode, gigi::types::EncryptionMode::None) {
+                            any_field_encrypted = true;
+                            def = def.with_encryption(mode);
+                        }
+                    }
+                }
+
                 schema = if is_base { schema.base(def) } else { schema.fiber(def) };
                 if f.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false) {
                     indexed_fields.push(fname);
@@ -6624,8 +6664,57 @@ fn init_app_bundles(engine: &mut Engine) {
             schema = schema.index(&f);
         }
 
+        // If any field requested encryption, install a GaugeKey on the
+        // schema. Seed source priority:
+        //   1. Bundle-level `seed_env` (env var name → 32-byte hex)
+        //   2. Fall back to CSPRNG random (with a loud warning — this
+        //      means the key is volatile across redeploys, which would
+        //      make any persisted ciphertext unrecoverable).
+        if any_field_encrypted {
+            let seed = match entry.get("seed_env").and_then(|v| v.as_str()) {
+                Some(env_name) => match std::env::var(env_name) {
+                    Ok(hex) => match gigi::crypto::seed_from_hex(&hex) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!(
+                                "[app-bundles] {name}: seed_env `{env_name}` is set but invalid hex: {e}. \
+                                 Skipping bundle creation — fix the secret and redeploy."
+                            );
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!(
+                            "[app-bundles] {name}: declared encrypted fields but seed_env \
+                             `{env_name}` is not set. Falling back to random seed — \
+                             this is acceptable for the FIRST creation but will make \
+                             ciphertext unrecoverable across the next redeploy. SET THE \
+                             SECRET FOR PRODUCTION."
+                        );
+                        gigi::crypto::GaugeKey::random_seed()
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "[app-bundles] {name}: declared encrypted fields without seed_env — \
+                         using random seed. Ciphertext will be unrecoverable across redeploys."
+                    );
+                    gigi::crypto::GaugeKey::random_seed()
+                }
+            };
+            schema.gauge_key = Some(gigi::crypto::GaugeKey::derive(&seed, &schema.fiber_fields));
+        }
+
         match engine.create_bundle(schema) {
-            Ok(_) => eprintln!("[app-bundles] created missing bundle: {name}"),
+            Ok(_) => {
+                if any_field_encrypted {
+                    eprintln!(
+                        "[app-bundles] created missing bundle: {name} (with gauge_key)"
+                    );
+                } else {
+                    eprintln!("[app-bundles] created missing bundle: {name}");
+                }
+            }
             Err(e) => eprintln!("[app-bundles] failed to create {name}: {e}"),
         }
     }
@@ -8448,6 +8537,183 @@ mod tests {
         // The malformed entry is skipped; the good one is created.
         assert!(engine.bundle_names().contains(&"good_bundle"));
 
+        cleanup(&dir);
+    }
+
+    /// Sprint G-pivot: per-field encryption from the manifest.
+    ///
+    /// When a fiber field declares `"encrypted": "opaque"` (or affine /
+    /// indexed), the bootstrap installs a GaugeKey on the schema using
+    /// the seed from the env var named in `seed_env`. Records inserted
+    /// into the bundle thereafter have their fiber values encrypted at
+    /// rest under the appropriate per-field transform.
+    ///
+    /// This is the entry point for "Just Gigi encryption": jg_kv's
+    /// `payload` field gets OPAQUE-encrypted via this path, with the
+    /// seed coming from a Fly secret.
+    #[test]
+    fn init_app_bundles_with_per_field_encryption() {
+        let dir = tmp_dir("init_app_bundles_encrypted");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        // Set the seed env var that the manifest references.
+        let lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var(
+                "TEST_JG_SEED",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+        }
+
+        let manifest = r#"[{
+            "name": "jg_kv_test",
+            "seed_env": "TEST_JG_SEED",
+            "base":  [{"name": "key", "type": "text"}],
+            "fiber": [
+                {"name": "kind", "type": "text", "indexed": true},
+                {"name": "payload", "type": "text", "encrypted": "opaque"},
+                {"name": "expires_at", "type": "timestamp", "indexed": true}
+            ]
+        }]"#;
+        // Hand-rolled inline (don't double-acquire the env_lock).
+        unsafe { std::env::set_var("GIGI_APP_BUNDLES", manifest); }
+
+        init_app_bundles(&mut engine);
+
+        // Bundle exists.
+        assert!(
+            engine.bundle_names().contains(&"jg_kv_test"),
+            "encrypted bundle must be created"
+        );
+
+        // GaugeKey was installed on the schema. Inspect via heap_bundle()
+        // so we get a direct &BundleStore (and drop the borrow before
+        // mutating the engine).
+        {
+            let store = engine.heap_bundle("jg_kv_test").expect("bundle present");
+            let schema = &store.schema;
+            assert!(
+                schema.gauge_key.is_some(),
+                "schema.gauge_key must be set when any fiber field declares encrypted"
+            );
+            let payload = schema
+                .fiber_fields
+                .iter()
+                .find(|f| f.name == "payload")
+                .expect("payload field present");
+            assert_eq!(
+                payload.encryption,
+                gigi::types::EncryptionMode::Opaque,
+                "payload must be OPAQUE-encrypted per manifest"
+            );
+            let kind = schema
+                .fiber_fields
+                .iter()
+                .find(|f| f.name == "kind")
+                .expect("kind field present");
+            assert_eq!(
+                kind.encryption,
+                gigi::types::EncryptionMode::None,
+                "kind has no encrypted clause → stays plaintext"
+            );
+        }
+
+        // Round-trip: insert a record, query it back, get plaintext.
+        let mut r = Record::new();
+        r.insert("key".into(), Value::Text("jg:conv:test1".into()));
+        r.insert("kind".into(), Value::Text("string".into()));
+        r.insert(
+            "payload".into(),
+            Value::Text("{\"messages\":[{\"role\":\"user\",\"body\":\"hi\"}]}".into()),
+        );
+        r.insert("expires_at".into(), Value::Timestamp(0));
+        engine.insert("jg_kv_test", &r).unwrap();
+
+        let store = engine
+            .heap_bundle("jg_kv_test")
+            .expect("bundle present in heap");
+        let mut key = Record::new();
+        key.insert("key".into(), Value::Text("jg:conv:test1".into()));
+        let got = store.point_query(&key).expect("record findable");
+        assert_eq!(
+            got.get("payload"),
+            Some(&Value::Text(
+                "{\"messages\":[{\"role\":\"user\",\"body\":\"hi\"}]}".into()
+            )),
+            "payload must round-trip to plaintext via gauge_key decrypt"
+        );
+
+        // The raw on-disk fiber for `payload` must be CIPHERTEXT, not
+        // the plaintext JSON string. This pins encryption-at-rest:
+        // get_fiber returns stored bytes without decrypting.
+        let bp = store.base_point(&key);
+        let raw_fiber = store.get_fiber(bp).expect("raw fiber present");
+        let payload_idx = store
+            .schema
+            .fiber_fields
+            .iter()
+            .position(|f| f.name == "payload")
+            .unwrap();
+        let raw_payload = &raw_fiber[payload_idx];
+        match raw_payload {
+            Value::Binary(_) => {
+                // Opaque mode stores ciphertext as a Binary value — exactly
+                // what we want.
+            }
+            other => panic!(
+                "raw payload should be Binary ciphertext, got {:?} \
+                 (encryption is not actually engaged at rest)",
+                other
+            ),
+        }
+
+        // Cleanup.
+        unsafe {
+            std::env::remove_var("TEST_JG_SEED");
+            std::env::remove_var("GIGI_APP_BUNDLES");
+        }
+        drop(lock);
+        cleanup(&dir);
+    }
+
+    /// When `seed_env` points to a missing env var, the bootstrap falls
+    /// back to a random seed (with a loud warning to stderr) — better
+    /// than refusing to start, but loudly so the operator notices and
+    /// sets the secret. The bundle is still created and is encrypted;
+    /// it just won't survive a redeploy.
+    #[test]
+    fn init_app_bundles_missing_seed_env_falls_back() {
+        let dir = tmp_dir("init_app_bundles_missing_seed");
+        cleanup(&dir);
+        let mut engine = Engine::open(&dir).unwrap();
+
+        let lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::remove_var("DEFINITELY_NOT_SET_AAA_BBB");
+            std::env::set_var(
+                "GIGI_APP_BUNDLES",
+                r#"[{
+                    "name": "jg_unset_seed",
+                    "seed_env": "DEFINITELY_NOT_SET_AAA_BBB",
+                    "fiber": [
+                        {"name": "p", "type": "text", "encrypted": "opaque"}
+                    ]
+                }]"#,
+            );
+        }
+
+        init_app_bundles(&mut engine);
+
+        // Bundle was still created with a random seed — better than
+        // crashing on startup. The schema has a gauge_key.
+        let store = engine
+            .heap_bundle("jg_unset_seed")
+            .expect("bundle present in heap");
+        assert!(store.schema.gauge_key.is_some());
+
+        unsafe { std::env::remove_var("GIGI_APP_BUNDLES"); }
+        drop(lock);
         cleanup(&dir);
     }
 }
