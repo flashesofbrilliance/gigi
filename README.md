@@ -108,12 +108,8 @@ code so a reviewer can read the claim and the implementation in the same place:
 - `GIGI_OBSERVABILITY_SPEC.md` — geometric logging / DHOOM event protocol
 - `GIGI_AUTOMATIC_ANALYTICS_API.md` — "the analytics ARE the database response"
 - `GIGI_PERSISTENCE_UPGRADE_SPEC.md` — WAL + mmap durability
-- `GIGI_AUDIT_RESULTS.md` — 81-check internal audit (post-fix: 289/289 tests, no CRITICAL findings)
 - `GIGI_PRODUCT_SPECS.md` — the three-product surface (Convert · Stream · Edge)
 - `GQL_SPECIFICATION.md` + `GQL_REFERENCE.md` + `GQL_ADDENDUM_v2.1.md` — the query language
-- `MARCELLA_TEAM_UPDATE.md` — fiber-geometric GQL deliverables for the Marcella NLP corpus
-- `KRAKEN_GIGI_INTEGRATION_SPEC.md` — KRAKEN sensor-fusion ↔ GIGI integration
-- `ICARUS_DELIVERY.md` — ICARUS sprint deliverables (7 features + WAL fix)
 
 ---
 
@@ -205,10 +201,9 @@ cd e2e && npm install && npm test
 ```
 
 As of this README the engine ships with **717 tests passing, 0 failed** (667
-unit tests across the library + 50 in the `gigi-stream` binary). The audit
-pass landed at 289/289 (see `GIGI_AUDIT_RESULTS.md`); the test suite has more
-than doubled since, picking up persistence, encryption, sheaf cohomology, and
-the Marcella sprint deliverables.
+unit tests across the library + 50 in the `gigi-stream` binary). The test suite
+has grown to cover persistence, encryption, sheaf cohomology, and additional
+geometric verbs since the v0.5 audit.
 
 ---
 
@@ -241,9 +236,9 @@ All NIST-standardized primitives, all from the RustCrypto suite. Spec:
 
 ## What plugs into GIGI
 
-- **Marcella** (NLP) — fiber-geometric reads of language corpora. `HOLONOMY`, `TRANSPORT`, `SPECTRAL ON FIBER` over (f11, f12) tense circles. See `MARCELLA_TEAM_UPDATE.md`.
-- **KRAKEN** (sensor fusion) — DAS / sonar / SAT / SIGINT bundles, CUSUM state, decisions, audit log, operator judgments — all on GIGI. See `KRAKEN_GIGI_INTEGRATION_SPEC.md`.
-- **ICARUS** (the seven-ask sprint) — 7 features + a WAL fix delivered. See `ICARUS_DELIVERY.md`.
+- **Marcella** (NLP) — fiber-geometric reads of language corpora. `HOLONOMY`, `TRANSPORT`, `SPECTRAL ON FIBER` over (f11, f12) tense circles.
+- **KRAKEN** (sensor fusion) — DAS / sonar / SAT / SIGINT bundles, CUSUM state, decisions, audit log, operator judgments — all on GIGI.
+- **ICARUS** — sprint deliverables across `Transport`, `Holonomy`, `GaugeTest`, `SpectralFiber`, and `Divergence` verbs.
 - **DHOOM** (`src/dhoom.rs`) — the canonical wire protocol used by every client.
 
 ---
@@ -281,10 +276,8 @@ the open with TDD: each spec carries a v0.x section that maps to a passing
 test in `cargo test`, and each landing-page claim is tied to a spec
 section.
 
-**Not in this README** are runtime data, deployment manifests
-(`fly.toml`, `Dockerfile`), or operator-only scripts. See `GIGI_DEPLOY_REQUEST.md`
-and `GIGI_DEPLOY_RESPONSE.md` for the deploy workflow, and `_local/` for
-restore tooling.
+**Not in this README** are runtime data, the operational deploy workflow, and
+operator-only restore tooling — those live in private channels.
 
 ---
 
