@@ -1,6 +1,28 @@
 # ARCS-LOCAL Build Backlog
 
 > **Mission:** Transform GIGI into a privacy-first local substrate for ARCS decision intelligence. Raw LLM is the floor, not the ceiling. The whale builds its own baleen plates.
+>
+> **Deeper mission:** Build a self-clarification instrument, not a decision assistant. Each validated receipt should increase the resolving power of judgment by making previously invisible dimensions of the user's specific decision geometry visible, queryable, and improvable. The system does not merely help route decisions; it progressively externalizes the user's frame of reference so the user can observe, refine, and eventually embody their own apparatus.
+
+---
+
+## North Star
+
+**Primary JTBD:**
+
+> So that each decision I make increases the resolving power of my own judgment — not by making me smarter in the abstract, but by making previously invisible dimensions of my specific decision geometry visible, queryable, and improvable.
+
+**Reference-of-frame principle:**
+
+Classical tools help a subject observe an object. ARCS-LOCAL inverts that frame: it externalizes the user's own coordinate system so the subject can become an objective subject — able to inspect the geometry of their own seeing, not just the thing seen.
+
+**Implication for the build:**
+
+- Receipts are not just logs; they are crystallized slices of frame-of-reference.
+- Templates are not just automations; they are reusable facets of judgment.
+- Gap logs are not just misses; they are shadow zones in the current coordinate system.
+- ALC synthesis is not just interpolation; it is controlled facet-cutting along valid geometric planes.
+- Privacy is not just data protection; it protects the integrity of the user's frame from external calibration.
 
 ---
 
@@ -18,6 +40,24 @@ L0 Raw signal
 **Privacy model:** Local-first. iCloud ADP as encrypted backup. State actor = named edge case, accepted.
 
 **Hardware target:** M1 MacBook Pro 16GB. GIGI Rust binary = CPU-only, ~0W. LLM compute = graceful cloud fallback with explicit user approval only.
+
+---
+
+## Design Intent
+
+### What this is
+- A progressive crystallographic map of a user's decision geometry.
+- A living starter culture of validated priors, fed by daily use.
+- A local-first filtration and fermentation substrate that makes the user's own frame increasingly legible.
+
+### What this is not
+- Not a generic decision support chatbot.
+- Not a static template library.
+- Not a convenience automation layer.
+- Not a cloud intelligence wrapper with local caching.
+
+### Success condition
+The end state is not merely that most sessions never touch the network. The end state is that the substrate becomes structurally part of the user's decision apparatus — transparent enough that the user stops noticing it as a separate tool.
 
 ---
 
@@ -43,7 +83,7 @@ L0 Raw signal
 ## Phase 1 — Foundation
 
 ### P1-1: GIGI Schema for ARCS Templates
-**JTBD:** As an ARCS user, I want a GIGI bundle schema that stores ARCS macro templates as fiber-bundle records so that local geometric retrieval can route decisions to the right template without any LLM involvement.
+**JTBD:** As an ARCS user, I want a GIGI bundle schema that stores ARCS macro templates as fiber-bundle records so that my repeated decisions become reusable facets of judgment, queryable by geometry rather than reconstructed from scratch each time.
 
 **Schema fields:**
 ```sql
@@ -100,11 +140,12 @@ CREATE INDEX idx_holonomy ON arcs_templates(theta_tense, theta_modal, theta_pos)
 - [ ] Insert, query-by-holonomy-distance, and promote-to-canonical operations working
 - [ ] 30 seed template records inserted (see P1-2)
 - [ ] Unit test: query returns correct template family for given fiber coordinates
+- [ ] Every stored canonical template can be described as a reusable facet of judgment, not just a formatting skeleton
 
 ---
 
 ### P1-2: Seed Template Library (30 canonical records)
-**JTBD:** As an ARCS user, I want a pre-populated template library covering core macro families so that the L1 gate catches common decisions from day one.
+**JTBD:** As an ARCS user, I want a pre-populated template library covering core macro families so that day-one usage begins with real facets already cut into the substrate, reducing reconstruction overhead and making judgment more immediately legible.
 
 **Seed matrix:**
 
@@ -137,11 +178,12 @@ CREATE INDEX idx_holonomy ON arcs_templates(theta_tense, theta_modal, theta_pos)
 - [ ] All 30 records inserted with valid fiber coordinates
 - [ ] Query by `macro_family=BAR, stakes=high` returns correct variants
 - [ ] No two canonical templates have holonomy distance < 0.1 (distinct facets)
+- [ ] Seed set spans multiple horizons and stakes clearly enough to expose frame differences, not just output differences
 
 ---
 
 ### P1-3: Gap Log Schema
-**JTBD:** As the substrate, I want every GIGI miss logged with structured metadata so that recurring gaps become visible and can be systematically closed.
+**JTBD:** As the substrate, I want every GIGI miss logged with structured metadata so that the system can reveal where the user's current frame lacks resolution, turning unknown terrain into visible shadow zones rather than silent failure.
 
 **Schema:**
 ```sql
@@ -190,11 +232,12 @@ distance ≥ 0.8            → HUMAN_REQUIRED (too far for synthesis)
 - [ ] Gap tier calculated automatically from holonomy distance
 - [ ] `recurrence_count` increments on duplicate gap pattern
 - [ ] Periodic review query: `SELECT * FROM gap_log WHERE recurrence_count > 3 ORDER BY recurrence_count DESC`
+- [ ] Gap review UI language frames misses as newly visible shadow detail, not simple errors
 
 ---
 
 ### P1-4: WAL Checkpoint + iCloud Backup Integration
-**JTBD:** As an ARCS user, I want GIGI to checkpoint and encrypt to iCloud automatically on Decision Receipt write so that I never lose validated decisions, and the backup never contains raw session content.
+**JTBD:** As an ARCS user, I want GIGI to checkpoint and encrypt to iCloud automatically on Decision Receipt write so that I never lose validated slices of my frame-of-reference, and the backup never contains raw session content.
 
 **Checkpoint triggers (semantic, not time-based):**
 ```
@@ -234,11 +277,12 @@ Prune: older incrementals
 - [ ] Encrypted blob appears in iCloud Drive path
 - [ ] Restore test: decrypt blob on same machine, verify record count matches
 - [ ] Battery-aware: checkpoint deferred if battery < 20% and not plugged in
+- [ ] Restore semantics preserve canonical priors and receipt lineage, not just file integrity
 
 ---
 
 ### P1-5: Holonomy Distance Query + L1 Gate
-**JTBD:** As the filtration system, I want the L1 gate to query GIGI for the nearest template by holonomy distance so that close-enough matches are served locally without reaching L2+.
+**JTBD:** As the filtration system, I want the L1 gate to query GIGI for the nearest template by holonomy distance so that close-enough matches are surfaced as already-cut facets of judgment, reducing conscious reconstruction load before L2+ is needed.
 
 **Query logic:**
 ```python
@@ -277,13 +321,14 @@ def l1_query(session_fiber_coords, macro_family, threshold=0.2):
 - [ ] Holonomy distance function matches pure-fiber paper spec (§2.4 weighted ℓ2)
 - [ ] Gap tier returned with every query result
 - [ ] Confidence score surfaced in UI: "Matched at distance 0.34 — verify before committing"
+- [ ] UI copy makes explicit when a match is a frame-of-reference aid versus a high-confidence canonical hit
 
 ---
 
 ## Phase 2 — Alchemist Module
 
 ### P2-1: ALC + VCE Structural Synthesis
-**JTBD:** As the L2 gate, I want the Alchemist to synthesize a CANDIDATE template from existing geometry when L1 returns PARTIAL_MATCH or ALC_CANDIDATE, so that variant gaps are filled locally without an LLM call.
+**JTBD:** As the L2 gate, I want the Alchemist to synthesize a CANDIDATE template from existing geometry when L1 returns PARTIAL_MATCH or ALC_CANDIDATE, so that variant gaps become new candidate facets cut along valid geometric planes instead of being offloaded immediately to an LLM.
 
 **ALC operation:**
 ```
@@ -317,11 +362,12 @@ if holonomy_distance >= 0.8:
 - [ ] Candidate surfaced to user with distance score visible
 - [ ] Candidate NOT auto-promoted — requires explicit user validation
 - [ ] Confidence floor enforced: no candidate emitted at distance ≥ 0.8
+- [ ] Candidate explanation language describes synthesis as controlled facet-cutting, not black-box generation
 
 ---
 
 ### P2-2: Validation + Promotion Flow
-**JTBD:** As an ARCS user, I want to validate ALC candidates with salt-to-taste editing so that my corrections become the canonical recipe and the Alchemist learns my palate from the delta.
+**JTBD:** As an ARCS user, I want to validate ALC candidates with salt-to-taste editing so that my corrections become the canonical recipe, the Alchemist learns my palate from the delta, and my frame becomes more precise through use.
 
 **Validation flow:**
 ```
@@ -352,13 +398,14 @@ ALC candidate surfaced
 - [ ] Edit delta stored for ALC calibration
 - [ ] Promoted templates immediately available for L1 queries
 - [ ] Rejected candidates never served again
+- [ ] Validation UI makes explicit that promotion turns a candidate into a genuine prior for future self
 
 ---
 
 ## Phase 3 — Cloud Fallback (Graceful, Explicit)
 
 ### P3-1: Controlled LLM Fallback (L4 Gate)
-**JTBD:** As the L4 gate, I want to send only abstract structural descriptions to the LLM when human authorship isn't available, so that novel macro families can be synthesized without exposing raw decision content.
+**JTBD:** As the L4 gate, I want to send only abstract structural descriptions to the LLM when human authorship isn't available, so that novel macro families can be synthesized without exposing raw decision content or surrendering the integrity of the user's frame-of-reference.
 
 **What gets sent (abstract structure only):**
 ```
@@ -391,6 +438,7 @@ Before any L4/L5 call:
 - [ ] Approval dialog shows exactly what will be sent
 - [ ] L5 (raw LLM) requires separate explicit approval
 - [ ] All L4/L5 calls logged with timestamp + what was sent (abstract only)
+- [ ] Approval copy explains that privacy protects frame integrity, not only content secrecy
 
 ---
 
@@ -407,6 +455,7 @@ Before any L4/L5 call:
 - [ ] Surface top-N recurring gaps (recurrence_count > 3)
 - [ ] One-session LLM batch: generate template skeletons for clustered gaps
 - [ ] INSERT all at once → library closes multiple gaps simultaneously
+- [ ] Cluster review language frames recurring gaps as persistent blind spots in frame resolution
 
 ### P4-3: Version Migration
 - [ ] `version_tag` field enables clean ARCS version upgrades
@@ -419,6 +468,7 @@ Before any L4/L5 call:
 - [ ] Verify: record count matches live DB
 - [ ] Verify: random sample of 5 templates matches expected content
 - [ ] Log restore test result in gap_log (special entry type)
+- [ ] Verify that restored state preserves continuity of priors across time, not just bytes on disk
 
 ---
 
@@ -457,8 +507,11 @@ Ongoing: P4-2 (gap clustering) + P4-3 (versioning) + P4-4 (restore tests)
 4. **ALC candidates never auto-promote.** You are always the validator.
 5. **Holonomy distance always visible.** No confident-looking miscalibrated output.
 6. **NOTOMATION intact.** The substrate scaffolds. You decide.
+7. **The substrate externalizes frame-of-reference, not just output structure.** Build for legibility of judgment, not convenience alone.
+8. **Privacy protects the user's coordinate system.** Protect frame integrity, not just data confidentiality.
 
 ---
 
 *Generated from ARCS-LOCAL architecture session, May 14 2026.*
+*Updated to include the “reference of frame” principle and self-clarification JTBD, May 14 2026.*
 *Companion papers: pure_fiber_lm_v1 (Davis, May 2026), geodesic_computation_v11 (Davis, April 2026).*
