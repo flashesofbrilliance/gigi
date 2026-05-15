@@ -36,6 +36,7 @@ Start here:
 - `FIELD_OS_CARD.md` — onboarding / handoff card
 - `ARCS_LOCAL_BACKLOG.md` — implementation backlog
 - `docs/conscious-os-eval-reference.html` — UI sketch for the eval layer
+- `docs/ARCS_PRE_MORTEM.md` — LAB/COURT/KKL pre-mortem + disaster recovery plan (rollback ladder, GitHub Actions workflows, latent risk probe)
 
 ### Design constraints
 
