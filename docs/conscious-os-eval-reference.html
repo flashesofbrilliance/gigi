@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Conscious OS Eval Stub</title>
+  <style>
+    :root {
+      --bg:#171614; --surface:#1c1b19; --surface2:#201f1d; --border:#393836; --text:#cdccca; --muted:#797876;
+      --primary:#4f98a3; --warning:#bb653b; --error:#d163a7; --success:#6daa45; --radius:16px;
+    }
+    *{box-sizing:border-box} body{margin:0;font:16px/1.5 Inter,system-ui,sans-serif;background:var(--bg);color:var(--text)}
+    .wrap{max-width:1100px;margin:0 auto;padding:32px 20px 64px}.grid{display:grid;gap:16px}.hero{margin-bottom:24px}
+    .hero h1{margin:0 0 8px;font-size:clamp(32px,5vw,56px)} .hero p{margin:0;color:var(--muted);max-width:70ch}
+    .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px}
+    .kpis{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))} .kpi strong{display:block;font-size:28px}
+    .row{display:flex;justify-content:space-between;gap:12px;align-items:center}.small{font-size:13px;color:var(--muted)}
+    .bar{height:10px;background:var(--surface2);border-radius:999px;overflow:hidden;margin-top:10px}.fill{height:100%;background:var(--primary)}
+    table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+    .badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.02em}
+    .true{background:color-mix(in srgb, var(--warning) 22%, transparent);color:#ffcca9}
+    .fuzzy{background:color-mix(in srgb, var(--primary) 22%, transparent);color:#bce7ee}
+    .incoherent{background:color-mix(in srgb, var(--error) 22%, transparent);color:#ffc0e5}
+    .under{background:color-mix(in srgb, var(--success) 22%, transparent);color:#cdebbc}
+    .list{display:grid;gap:10px}.item{padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface2)}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Conscious OS Eval</h1>
+      <p>JTBD: surface where the frame still lacks resolution so gaps become diagnostics, not failures.</p>
+    </section>
+
+    <section class="grid kpis">
+      <div class="panel kpi"><div class="small">Active shadow zones</div><strong>4</strong><span class="small">Coordinates still at 0.20 threshold</span></div>
+      <div class="panel kpi"><div class="small">ROM welds this quarter</div><strong>7</strong><span class="small">Pain metabolized into structural priors</span></div>
+      <div class="panel kpi"><div class="small">Incoherence flags</div><strong>2</strong><span class="small">Outputs that sounded right but failed receipts logic</span></div>
+      <div class="panel kpi"><div class="small">Schema needs</div><strong>3</strong><span class="small">UNDER_INSTRUMENTED gaps awaiting field upgrades</span></div>
+    </section>
+
+    <section class="grid" style="grid-template-columns:1.2fr .8fr; margin-top:16px;">
+      <div class="panel">
+        <div class="row"><h2 style="margin:0">Lens sharpness by coordinate</h2><span class="small">Threshold = local confidence gate</span></div>
+        <div class="item"><div class="row"><span>BAR / high / today</span><span>0.38 refined</span></div><div class="bar"><div class="fill" style="width:76%"></div></div></div>
+        <div class="item"><div class="row"><span>KKL / high / this-quarter</span><span>0.28 intermediate</span></div><div class="bar"><div class="fill" style="width:56%"></div></div></div>
+        <div class="item"><div class="row"><span>LAB / ambiguous / 1-3yr</span><span>0.20 coarse</span></div><div class="bar"><div class="fill" style="width:40%"></div></div></div>
+        <div class="item"><div class="row"><span>Kintsugi / repair</span><span>0.20 shadow zone</span></div><div class="bar"><div class="fill" style="width:32%"></div></div></div>
+      </div>
+      <div class="panel">
+        <div class="row"><h2 style="margin:0">Signal types</h2><span class="small">New gap semantics</span></div>
+        <div class="list">
+          <div class="item"><span class="badge true">TRUE_UNDEFINED</span><div class="small">Frontier reached; hold density, do not clip.</div></div>
+          <div class="item"><span class="badge fuzzy">FUZZY_TRUTH</span><div class="small">Shape is close but under-specified; sharpen template.</div></div>
+          <div class="item"><span class="badge incoherent">INCOHERENT_RATIONALE</span><div class="small">Plausible output fails BAR / KKL / LAB inspection.</div></div>
+          <div class="item"><span class="badge under">UNDER_INSTRUMENTED</span><div class="small">Schema lacks fields to represent the ask; upgrade substrate.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:16px;">
+      <div class="row"><h2 style="margin:0">Top HUMAN_REQUIRED coordinates</h2><span class="small">Where the pain still lives</span></div>
+      <table>
+        <thead><tr><th>Coordinate</th><th>Signal</th><th>Meaningful next move</th></tr></thead>
+        <tbody>
+          <tr><td>LAB / ambiguous / 1-3yr</td><td><span class="badge true">TRUE_UNDEFINED</span></td><td>Hold as human-authored facet candidate; do not force synthesis yet.</td></tr>
+          <tr><td>Receipt / relational / high-stakes</td><td><span class="badge fuzzy">FUZZY_TRUTH</span></td><td>Fork nearest canonical receipt and sharpen slots.</td></tr>
+          <tr><td>Kintsugi / repair / adversarial</td><td><span class="badge incoherent">INCOHERENT_RATIONALE</span></td><td>Audit with BAR + LAB; mark divergence explicitly in receipts.</td></tr>
+          <tr><td>New macro family / embodied signal</td><td><span class="badge under">UNDER_INSTRUMENTED</span></td><td>Create schema ticket; current substrate cannot represent this cleanly.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
