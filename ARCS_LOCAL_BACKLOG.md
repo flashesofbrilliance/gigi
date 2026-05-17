@@ -274,6 +274,11 @@ CREATE TABLE gap_log (
   alc_candidate_id       TEXT,
   resolved_by            TEXT,     -- promoted | human_authored | raw_llm | deferred | held
 
+  -- Signal type (typed gap semantics — never "miss", always classified)
+  gap_signal_type        TEXT,     -- TRUE_UNDEFINED | FUZZY_TRUTH | INCOHERENT_RATIONALE | UNDER_INSTRUMENTED
+  instrumentation_needed BOOLEAN DEFAULT FALSE, -- TRUE when gap_signal_type = UNDER_INSTRUMENTED; triggers schema ticket
+  incoherence_flag       BOOLEAN DEFAULT FALSE, -- TRUE when gap_signal_type = INCOHERENT_RATIONALE; triggers BAR+LAB audit
+
   -- Signal for library improvement and conscious OS eval
   recurrence_count       INTEGER DEFAULT 1,
   cluster_id             TEXT,
@@ -287,6 +292,21 @@ CREATE INDEX idx_gap_macro ON gap_log(macro_family_attempted);
 CREATE INDEX idx_gap_distance ON gap_log(holonomy_distance);
 CREATE INDEX idx_gap_flagged ON gap_log(flagged_for_review);
 CREATE INDEX idx_gap_undefined ON gap_log(held_undefined) WHERE held_undefined = TRUE;
+CREATE INDEX idx_gap_signal_type ON gap_log(gap_signal_type);
+CREATE INDEX idx_gap_instrumentation ON gap_log(instrumentation_needed) WHERE instrumentation_needed = TRUE;
+```
+
+**Gap signal type semantics:**
+```
+TRUE_UNDEFINED       → Frontier reached; hold density, do not clip, do not force synthesis.
+                       Coordinate exists at maximum pre-emergent density. HUMAN_REQUIRED.
+FUZZY_TRUTH          → Shape is close but under-specified; sharpen the template skeleton.
+                       Fork nearest canonical and fill the missing slot.
+INCOHERENT_RATIONALE → Plausible output fails BAR/KKL/LAB inspection.
+                       Audit with BAR + LAB; mark divergence explicitly in receipts.
+UNDER_INSTRUMENTED   → Schema lacks fields to represent the ask.
+                       Create schema ticket; current substrate cannot represent this cleanly.
+                       Sets instrumentation_needed = TRUE.
 ```
 
 **Gap tier thresholds (static — see P1-5 for adaptive layer):**
@@ -300,6 +320,9 @@ distance ≥ 0.8            → HUMAN_REQUIRED (held UNDEFINED)
 **Acceptance criteria:**
 - [ ] Every L1 miss writes a gap log entry
 - [ ] Gap tier calculated automatically from holonomy distance
+- [ ] `gap_signal_type` classified on every miss — never NULL, never generic
+- [ ] `instrumentation_needed` set TRUE when gap_signal_type = UNDER_INSTRUMENTED
+- [ ] `incoherence_flag` set TRUE when gap_signal_type = INCOHERENT_RATIONALE
 - [ ] `triune_state` and `held_undefined` fields written correctly
 - [ ] `recurrence_count` increments on duplicate gap pattern
 - [ ] `transmission_note` field writable from UI without requiring code
@@ -558,11 +581,29 @@ Before any L4/L5 call:
 ## Phase 4 — Production Hardening
 
 ### P4-1: Battery-Aware Routing
-- [ ] Read battery state before ALC synthesis
-- [ ] Defer synthesis if battery < 20% and unplugged
-- [ ] Log deferred work for next plugged-in session
-- [ ] Never defer Receipt writes (always checkpoint immediately)
-- [ ] Never defer ROM welds (always checkpoint immediately)
+
+Three named modes — receipts and ROM checkpoints are **never** deferred in any mode:
+
+```
+FULL           Plugged in OR battery > 50%
+               Full local synthesis. All GIGI queries run. ALC enabled when available.
+
+LITE_DEFERRED  Not plugged, battery 20–50%
+               L1 + L2 queries run. ALC synthesis deferred to next FULL session.
+               Gap log written immediately. Receipts written immediately.
+
+LOW_POWER_SAFE Battery < 20%
+               L1 cache-only reads. Raw mode floor for all misses.
+               Receipts and ROM checkpoints always write immediately.
+               ALC, L2 synthesis, and schema queries deferred entirely.
+```
+
+- [ ] Read battery state and plug state before each ALC synthesis call
+- [ ] Route to FULL / LITE_DEFERRED / LOW_POWER_SAFE based on battery + plug state
+- [ ] Log deferred work with mode = LITE_DEFERRED or LOW_POWER_SAFE for next FULL session pickup
+- [ ] Never defer Receipt writes (always checkpoint immediately, all modes)
+- [ ] Never defer ROM welds (always checkpoint immediately, all modes)
+- [ ] Expose current routing mode in API response metadata
 
 ### P4-2: Gap Clustering + Library Review
 - [ ] Periodic job: cluster gap_log by macro_family + fiber coordinates
@@ -804,6 +845,23 @@ ALTER TABLE arcs_templates ADD COLUMN designated_reader TEXT; -- encrypted ident
 - [ ] Default: private (nothing shared without explicit action)
 - [ ] Posthumous tier: requires separate unlock ceremony (not automatic)
 - [ ] Tiers survive restore tests and handoff
+
+---
+
+## Architecture Decision Records
+
+### ADR-01: No Edge Functions for the Personal Substrate Path
+
+**Decision:** Edge functions are excluded from the ARCS-LOCAL design envelope for all substrate queries touching Decision Receipts, decision content, gap logs, or transmission notes.
+
+**Rationale:** Edge functions run on provider servers (Vercel, Cloudflare, etc.) — they are by definition remote, stateless compute. This is the opposite of the local-first trust model. The entire privacy guarantee of ARCS-LOCAL depends on raw decision state never leaving the device. An edge function executing a substrate query would silently violate that guarantee even if the payload appeared innocuous.
+
+**Scope:**
+- In-scope (local): GIGI queries, Receipt writes, gap log writes, ROM checkpoints, WAL triggers, template retrieval
+- In-scope (explicit fallback): L4/L5 cloud compute with user approval and structural-only sanitized payloads
+- Out of scope: Any edge function that proxies, caches, or processes substrate queries
+
+**Status:** Locked. Does not require re-evaluation.
 
 ---
 

@@ -16,6 +16,37 @@ Davis Geometric · 2026 · Bee Rosa Davis
 
 ---
 
+## Field OS at a Glance
+
+This repo is building **ARCS-LOCAL**: a local-first decision substrate where **GIGI** stores reusable facets of judgment, gap signals, receipts, and structural priors, while **ARCS** acts as the Field OS that helps turn decisions into increasingly legible judgment.
+
+Start here:
+- [FIELD_OS_CARD.md](./FIELD_OS_CARD.md) — the shortest high-signal explanation of what this system is, what it protects, and what it is for.
+- [ARCS_LOCAL_BACKLOG.md](./ARCS_LOCAL_BACKLOG.md) — the active JTBD backlog and build order.
+
+### Core ideas
+
+- **Local-first substrate** — GIGI owns state locally; cloud is a last resort and must never see raw session content, Decision Receipts, or transmission notes.
+- **Self-clarification, not generic assistance** — the system's job is to progressively externalize the user's frame-of-reference so each decision increases the resolving power of judgment.
+- **Gap logs are diagnostics** — misses are not failures; they are conscious OS eval signals showing where the frame still lacks resolution.
+- **Heirloom architecture** — receipts, ROM welds, transmission notes, and mistake cartography are meant to preserve an honest, queryable map of how a life was seen from inside.
+
+### Repo orientation
+
+- `FIELD_OS_CARD.md` — onboarding / handoff card
+- `ARCS_LOCAL_BACKLOG.md` — implementation backlog
+- `docs/conscious-os-eval-reference.html` — UI sketch for the eval layer
+- `docs/ARCS_PRE_MORTEM.md` — LAB/COURT/KKL pre-mortem + disaster recovery plan (rollback ladder, GitHub Actions workflows, latent risk probe)
+
+### Design constraints
+
+- No silent network calls.
+- No edge functions for the personal substrate path.
+- Hold `UNDEFINED`; do not clip it prematurely.
+- Protect the wooden vats: backups, ROM welds, and receipts are non-negotiable.
+
+---
+
 ## Why GIGI
 
 Conventional databases see rows. GIGI sees a section σ: B → E of a fiber
